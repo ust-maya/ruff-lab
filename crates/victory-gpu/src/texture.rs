@@ -2063,9 +2063,10 @@ mod host_written_tests {
         let resource = 0x1000usize;
         {
             let mut written = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-            written.replace(Default::default()).map(|_| ());
+            *written = Some(Default::default());
             written
-                .get_or_insert_with(Default::default)
+                .as_mut()
+                .expect("just set")
                 .insert(resource);
             HOST_WRITTEN_ANY.store(true, std::sync::atomic::Ordering::Release);
         }
