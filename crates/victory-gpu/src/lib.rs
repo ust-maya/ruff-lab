@@ -18,6 +18,8 @@
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+pub mod bench;
+#[cfg(windows)]
 mod bound;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;

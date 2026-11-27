@@ -7741,6 +7741,11 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// Never reset: `wall_ms` of every bench sample is measured from here,
+    /// since `since` resets every second for the `fps` aggregate.
+    bench_started: std::time::Instant,
+    bench_samples: Vec<crate::bench::BenchSample>,
+    bench_done: bool,
 }
 
 impl Meter {
@@ -7754,6 +7759,9 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            bench_started: now,
+            bench_samples: Vec::new(),
+            bench_done: false,
         }
     }
 
@@ -7792,6 +7800,60 @@ impl Meter {
         let wc_sample = crate::wc::take(frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        // Bench heavy counting, in the 1-second block (not the 5-second
+        // `logged` gate below, which would fire once per 5 s). Reads only the
+        // already-computed locals: the counters consumed above must not be
+        // consumed twice. With `VICTORY_BENCH_HEAVY` unset this is one branch.
+        if !self.bench_done
+            && let Some(target) = crate::bench::bench_target()
+            && crate::bench::is_heavy(draws, ms)
+        {
+            let wall_ms = self.bench_started.elapsed().as_secs_f64() * 1000.0;
+            self.bench_samples.push(crate::bench::BenchSample {
+                fps,
+                ms,
+                draws,
+                cpu,
+                gpu,
+                back_ms,
+                wall_ms,
+            });
+            if self.bench_samples.len() as u64 >= target && crate::bench::try_begin_exit() {
+                let samples = self.bench_samples.clone();
+                let out = crate::bench::bench_out_path();
+                // Deferred exit, never inline: `save_pipeline_cache()`
+                // serialises ~GB and must not run synchronously under the
+                // presenter lock / inside a log line, and `process::exit`
+                // here would skip COM, the destructors and run.rs's own save.
+                // The thread hands the samples over; it writes the bench JSON
+                // (tmp+rename, flushed) and only then exits. Spawning is
+                // fast; the thread's heavy work outlives this `frame()` call
+                // (the presenter lock `present()` holds is dropped when it
+                // returns, long before the ~GB save finishes).
+                let spawned = std::thread::Builder::new()
+                    .name("victory-bench-exit".to_owned())
+                    .spawn(move || {
+                        crate::pipeline::save_pipeline_cache();
+                        match out {
+                            Some(path) => {
+                                if let Err(e) =
+                                    crate::bench::write_bench_json(&path, &samples)
+                                {
+                                    tracing::warn!(error = %e, "bench JSON not written");
+                                }
+                            }
+                            None => tracing::warn!(
+                                "bench done but VICTORY_BENCH_OUT is unset: bench JSON not written"
+                            ),
+                        }
+                        std::process::exit(0);
+                    });
+                match spawned {
+                    Ok(_) => self.bench_done = true,
+                    Err(e) => tracing::warn!(error = %e, "bench exit thread not started"),
+                }
+            }
+        }
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
