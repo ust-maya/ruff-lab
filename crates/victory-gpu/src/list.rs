@@ -253,6 +253,34 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (128, 256 << 20);
 
+/// The most host lists kept idle (`VICTORY_IDLE_LISTS`, at most
+/// [`IDLE_MOST`]'s count, which is also the default when unset). Caps only
+/// when the env is set (Belobug #620 / RDNA 2 allocator ceiling).
+#[cfg(windows)]
+fn idle_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_IDLE_LISTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(IDLE_MOST.0)
+            .min(IDLE_MOST.0)
+    })
+}
+
+/// The most host lists alive before lists that have run are let go instead
+/// of kept (`VICTORY_LIST_CEILING`; unset: no ceiling, as before). Belobug
+/// #620: on RDNA 2, ~1300 held with the relay on.
+#[cfg(windows)]
+fn list_ceiling() -> Option<u64> {
+    static MOST: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_LIST_CEILING")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -317,7 +345,15 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most()
+        {
+            continue;
+        }
+        if list_ceiling().is_some_and(|most| {
+            crate::host::ALIVE[0].load(std::sync::atomic::Ordering::Relaxed) > most
+        }) {
+            let spare = std::mem::take(&mut *IDLE.lock().unwrap_or_else(|e| e.into_inner()));
+            drop(spare);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -325,7 +361,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < idle_most() && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
