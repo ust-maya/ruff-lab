@@ -44,4 +44,20 @@ Do not commit game files, dumps, shader dumps, screenshots, or `victory.toml`. P
 
 Leave the default path alone. A new speedup is a flag that defaults to the old path until there is a captured frame and a clean D3D12 Debug Layer run. Do not replace the incremental `heap_buffers` walk (`VICTORY_HEAP_RESCAN_FRAMES`, a rotating 1/N slice) with a full scan.
 
-Commit subjects in this repo use `perf`, `fix`, and `docs`. Say in the message when the change was not run on Windows.
+## Commits and branches
+
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/):
+
+```
+<type>[optional scope][!]: <description>
+```
+
+`feat` and `fix` are the required types. Also use `perf`, `docs`, `refactor`, `test`, `build`, `ci`, and `chore`. The subject is lowercase and has no trailing period. A breaking change takes `!` after the scope, or a `BREAKING CHANGE:` footer. Say in the body when the change was not run on Windows.
+
+Branch names follow [Conventional Branch](https://conventionalbranch.org/) 1.1.0: `<type>/<description>`, lowercase, hyphen-separated. No underscores, no uppercase, no doubled or leading or trailing hyphens.
+
+Purpose types: `feature/` (or `feat/`), `bugfix/` (or `fix/`), `hotfix/`, `release/`, `chore/`. `main` takes no prefix. A docs or dependency change is `chore/`, not `docs/`. The branch states the purpose of the work. Individual commits on it still use their own Conventional Commits types, including `perf` and `docs`.
+
+Examples: `feature/heap-skip-tabled`, `fix/header-bug`, `chore/agents-md`, `release/v1.2.0`.
+
+An agent that opens the branch itself prefixes it with its own name: `cursor/`, `claude/`, `codex/`, `copilot/`, or the vendor-neutral `ai/`. The description after that prefix follows the same grammar.
