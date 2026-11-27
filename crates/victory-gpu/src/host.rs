@@ -3126,6 +3126,7 @@ fn land() {
 /// value while the submitting thread waits for that thread would never
 /// see it.
 fn late_helper() {
+    crate::affinity::keep_on_fast_cores("victory-late-wait");
     let Some(host) = host() else {
         return;
     };
@@ -3248,6 +3249,7 @@ struct RelayFetch {
 /// anything a caller of [`Host::settle`] may hold: resetting the landed
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
+    crate::affinity::keep_on_fast_cores("victory-relay");
     let Some(host) = host() else {
         return;
     };
@@ -5309,6 +5311,14 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        thread_local! {
+            static PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        PINNED.with(|pinned| {
+            if !pinned.replace(true) {
+                crate::affinity::keep_on_fast_cores("victory-submit");
+            }
+        });
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
