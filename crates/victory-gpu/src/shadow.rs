@@ -4364,6 +4364,35 @@ fn exact_reuse() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_REUSE").is_none_or(|v| v != "0"))
 }
 
+/// Whether a miss allocates (and idle copies are swept) with [`EXACT`] free,
+/// and the idle ones looked for only now and then. Off by default; set
+/// `VICTORY_VIEW_COPY_ASIDE=1` (Belobug #611). The old path looks for idle
+/// copies under the lock on a miss when many are kept.
+fn view_copy_aside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_COPY_ASIDE").is_some_and(|v| v == "1"))
+}
+
+/// Whether a new exact view copy is made with [`EXACT`] free, and idle copies
+/// are swept only now and then (`VICTORY_VIEW_COPY_ASIDE=1`, off by default;
+/// Belobug #611). Off: look for idle copies under the lock on the miss path
+/// as before. On: allocate outside the lock and sweep only every
+/// [`OWN_LATELY`] askings once many copies are kept.
+fn view_copy_aside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_COPY_ASIDE").is_some_and(|v| v == "1"))
+}
+
+/// Copies kept before the idle ones are looked for, and the askings an idle
+/// one stays for (`VICTORY_VIEW_COPY_ASIDE`).
+const OWN_MANY: usize = 256;
+const OWN_LATELY: u64 = 512;
+
+/// Whether the idle exact copies are due for a sweep under the aside path.
+fn own_sweep_due(kept: usize, asked: u64, swept: u64) -> bool {
+    kept >= OWN_MANY && asked.saturating_sub(swept) >= OWN_LATELY
+}
+
 /// Releases pooled exact-copy buffers when physical RAM is tight (< 3 GiB)
 /// or WDDM shared GPU memory is under high pressure.
 fn let_go_idle_exact_pool() {
@@ -4384,7 +4413,9 @@ fn let_go_idle_exact_pool() {
 /// `address` itself: for a buffer view whose bytes do not start on an
 /// element of the copy its buffer has (`descriptor/host.rs` `own_bytes`).
 /// Allocates/maps outside the global `EXACT` lock and recycles freed buffers
-/// by size (`kitty-core/Kitty6` `9eb362c`).
+/// by size (`kitty-core/Kitty6` `9eb362c`). With `VICTORY_VIEW_COPY_ASIDE=1`
+/// the miss path also sweeps idle copies only now and then, after the lock
+/// (Belobug #611).
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
     /// idle one stays for.
@@ -4400,22 +4431,26 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let size = len.next_multiple_of(256);
+    let key = (address, len);
+    let aside = view_copy_aside();
     let mut freed = Vec::new();
     {
         let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
         let (tick, map) = &mut *guard;
         *tick += 1;
         let now = *tick;
-        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+        if let Some((shadow, used)) = map.get_mut(&key) {
             *used = now;
             shadow.used.store(crate::host::moment(), Ordering::Relaxed);
             return Some(shadow.clone());
         }
-        if map.len() >= MANY && now >= EXACT_LOOKED.load(Ordering::Relaxed) + LOOK_EVERY {
+        // Aside: leave the lock before any allocate or sweep. Old path: look
+        // for idle copies under the lock when many are kept.
+        if !aside
+            && map.len() >= MANY
+            && now >= EXACT_LOOKED.load(Ordering::Relaxed) + LOOK_EVERY
+        {
             EXACT_LOOKED.store(now, Ordering::Relaxed);
-            // Held by the map alone (no list), its buffer by the copy alone (no
-            // slot shows it), and not asked for lately: its buffer is kept for
-            // the next copy of its size (`exact_reuse`).
             map.retain(|_, (shadow, used)| {
                 let keep = Arc::strong_count(shadow) > 1
                     || crate::host::references(&shadow.buffer) > 1
@@ -4470,12 +4505,35 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    let now = *tick;
-    // Another thread may have made the same copy meanwhile: theirs is kept.
-    let (kept, _) = map.entry((address, len)).or_insert((shadow, now));
-    Some(kept.clone())
+    let mut gone = Vec::new();
+    let kept = {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        let now = *tick;
+        // Another thread may have made the same copy meanwhile: theirs is kept.
+        if let Some((there, used)) = map.get_mut(&key) {
+            *used = now;
+            there.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(there.clone());
+        }
+        if aside && map.len() >= MANY && now >= EXACT_LOOKED.load(Ordering::Relaxed) + LATELY {
+            EXACT_LOOKED.store(now, Ordering::Relaxed);
+            map.retain(|_, (kept, used)| {
+                let keep = Arc::strong_count(kept) > 1
+                    || crate::host::references(&kept.buffer) > 1
+                    || *used + LATELY > now;
+                if !keep {
+                    gone.push(kept.clone());
+                }
+                keep
+            });
+        }
+        map.insert(key, (shadow.clone(), now));
+        shadow
+    };
+    // Freed after the lock so other threads are not held up by drops.
+    drop(gone);
+    Some(kept)
 }
 
 /// With the frame line: the buffer views that got a copy of their own
