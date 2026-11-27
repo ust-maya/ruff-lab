@@ -1,13 +1,13 @@
 <h1 align="center">ruff-lab</h1>
 
 <p align="center">
-  <b>An open-source Xbox Series X|S (Scarlett) compatibility runtime fork tuned for mid-range PCs: 8 GB VRAM, 16 GB RAM, and rotational HDDs.</b>
+  <b>An open-source Xbox Series X|S (Scarlett) compatibility runtime fork tuned for mid-range PCs: 8 GB VRAM, 32 GB RAM, and mixed HDD/NVMe storage.</b>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/base-KLBF%20Lab%2039-1f46c8" alt="Base: KLBF Lab 39">
-  <img src="https://img.shields.io/badge/GPU-AMD%20RX%206600%20XT%208GB-ed1c24" alt="GPU: AMD RX 6600 XT 8GB">
-  <img src="https://img.shields.io/badge/RAM-16%20GB-1f46c8" alt="RAM: 16 GB">
+  <img src="https://img.shields.io/badge/GPU-AMD%20RX%206650%20XT%208GB-ed1c24" alt="GPU: AMD RX 6650 XT 8GB">
+  <img src="https://img.shields.io/badge/RAM-32%20GB-1f46c8" alt="RAM: 32 GB">
   <img src="https://img.shields.io/badge/license-GPL--3.0-555" alt="GPL-3.0">
 </p>
 
@@ -18,9 +18,9 @@
 
 ## Status (2026-11-27)
 
-**Stage 6 — In-game (player-controlled gameplay verified)** on an 8 GB VRAM / 16 GB RAM PC.
+**Stage 6 — In-game (player-controlled gameplay verified earlier)**; this host re-checked boot/UI live with Wave 7 flags.
 
-Tested on: **Windows 10 x64 (`10.0.26300`)** · **AMD Radeon RX 6600 XT 8 GB** (RDNA2, Adrenalin **26.11.2** / `32.0.21045.29003`) · **AMD Ryzen 5 3600** (6C/12T) · **16 GB RAM** (pagefile on **M.2 NVMe SSD**) · game files on `G:\GTA6\...` (PowerShell).
+Tested on this PC: **Windows 11 Pro (`10.0.26300`)** · **AMD Radeon RX 6650 XT 8 GB** (RDNA2, driver `32.0.21045.29003`) · **AMD Ryzen 5 8400F** (6C/12T) · **32 GB RAM** · pagefile on **C:** (**ADATA LEGEND 900** NVMe) · game/build on **G:** (Storage Spaces over **R5MP480G8** NVMe, ~447 GB) · also **ST1000DL002** 1 TB SATA HDD · PowerShell.
 
 **Paths on this PC**
 
@@ -32,8 +32,8 @@ Tested on: **Windows 10 x64 (`10.0.26300`)** · **AMD Radeon RX 6600 XT 8 GB** (
 
 | Lane / Stage | Status | Details |
 |---|---|---|
-| **Boot & D3D12 init** | ✅ Works | Native Wave64 (`min=32 max=64 compute=64`); `0.5–1.2 ms` GPU; D3D12 Debug Layer verified (**587 / 587** tests green across `victory-formats`, `victory-shader`, `victory-gpu`, `victory-hle`, `victory-pipeline`, 0 Debug Layer errors) |
-| **Setup, menus & pause UI (`series-s` + FSR)** | ✅ Works | **30.0 fps** in menus/loading, **22 fps** in pause menu (`VI` HUD, map/game/settings tabs, clean blur); scene preload gate with monotonic title clock freeze before prologue |
+| **Boot & D3D12 init** | ✅ Works | Native Wave64 (`min=32 max=64 compute=64`); live 2026-11-27 on RX 6650 XT: D3D12 device ready, title window up; unit Debug Layer coverage historically green (see prior rows) |
+| **Setup, menus & pause UI (`series-s` + FFX simple)** | ✅ Works | Live 2026-11-27: account-select / load UI at **30.0 fps** (`33.3 ms/frame`, `14` draws) with `VICTORY_LOW_GRAPHICS=1`; earlier runs also had **22 fps** pause menu |
 | **Offline pipeline pre-build** | ✅ Works | `27,144 / 27,144` pipelines built in `1,029 s` with **0 `amdxc64.dll` crashes** |
 | **Player control (Stage 6)** | ✅ Verified | **Native DualShock 4 (`0x09CC`) HID input** with `VICTORY_ONE_PAD=1` reconnect-pause fix — walked & rotated camera (`L`/`R`) through prison yard/cell, interacted with cellmate (`LT`), followed guard, progressed through counselor's office, exterior/car scenes & cutscenes (with audio) |
 | **Picture (in-world)** | 🟢 Natural lighting & textures | Wave 6 `ambient.rs` enables balanced sky-dome-following ambient by default (`gain=0.44, least=0.075, power=0.36`, unit-luma night tint, capped at `0.6`, `0.28` pre-sky fallback, `reflections held=0.5`, `VICTORY_AMBIENT_SKY=off` reverts to constant `0.6`), eliminating both night auto-exposure white blowout and indoor dawn silhouettes; 79 card-resident buffers (`657 MB`, `0.0 MB` CPU spill); Wave 4 fixed all `226 -> 0` refused raw buffer views (`own_bytes`) and 9-bit `exp prim`; Wave 5 adds 16-bit `half_views` (NPC facial animation network + `ped_standard_head_cs`), BC7 mode 4/5 rotation fix, RDNA 2 `v_fmac_f32` accumulator `abs`/`neg`, `ForceEarlyDepthStencil`, `VICTORY_D16_BITS`, `VICTORY_SPILL_STRICT`, and aliased texture re-copy |
@@ -46,7 +46,7 @@ Full session-by-session logs: [logs/results.md](logs/results.md).
 
 ## What `ruff-lab` adds on top of KLBF Lab 39
 
-Most compatibility forks are tested on 32 GB RAM and 12–16 GB VRAM cards. `ruff-lab` focuses on making the runtime viable on **8 GB GPUs, 16 GB RAM hosts, and HDD storage**:
+Most compatibility forks are tested on 32 GB RAM and 12–16 GB VRAM cards. `ruff-lab` focuses on **8 GB GPUs** (this host: RX 6650 XT + 32 GB RAM) and still keeps the older **16 GB RAM / HDD** mitigations:
 
 | Area | Problem on 8 GB / 16 GB / HDD | Fix in `ruff-lab` |
 |---|---|---|
@@ -69,13 +69,13 @@ Most compatibility forks are tested on 32 GB RAM and 12–16 GB VRAM cards. `ruf
 | **Wave 6.5: GPU texture detiling, black/blocky face fixes & slow-compute thinning** | CPU texture detiling ate Ryzen 5 3600 cycles during streaming; placed textures uploaded mid-read or painted through alias views (NPC faces/hair) stayed black or blocky; dynamic slots could release into a reused heap address; single-group compute shader `02384a60fda6f2d0` stalled the GPU up to `~10.9 ms/frame` | Ported GPU compute detiling (`gpudetile.rs`, `VICTORY_GPU_DETILE=1` default ON, adapted from `fxceless/victory-fork` `3461f52`) with mip-drop (`dropped > 0`) support and a `64 MiB` VRAM pool integrated into `klbf-lab#23` idle staging eviction; ported `VICTORY_PAGE_WRITES` default `1\|2\|8`, `HostHeap::id` dynamic-slot ownership guard, full `xxh3-128` fingerprinting & periodic recheck for aliased textures (`VICTORY_FULL_PRINT_KB`/`VICTORY_ALIASED_RECHECK_EVERY`, `Kitty6` `aca0877` + `ae3cce8`); thinned `02384a60fda6f2d0` to every 4th frame (`VICTORY_THIN_SLOW_COMPUTE=4`, `Kitty6` `7124a8f`); and added opt-in `VICTORY_INPLACE_CONSTANTS` (`fxceless` `bcc5421`, default OFF for PCIe x8 GPUs) — zero shader-cache invalidation |
 | **Wave 6.6: WDDM L0 shared-memory OOM fix, root-window deduplication & texture-pass hotfix** | On 16 GB RAM PCs (WDDM L0 shared GPU memory cap `~7.5 GiB`), `root_window` created overlapping 32 MiB windows every 4 MiB cell (`shared` grew `994 MB -> 6,561 MB+` -> `E_OUTOFMEMORY 0x8007000E` after ~23 min and duplicated `copies` up to `185.9 MB/frame`); `fingerprint_texture` switched between `blake3` and `xxh3-128` whenever alias state toggled (`38,001` false re-uploads / `23.3 GB` churn); `heap_textures` called `resource::let_go_idle()` every frame when VRAM was full (`22–28.9 ms/frame`); and `E_OUTOFMEMORY` aborted without draining idle L0 pools | Deduplicated `LOOSE` root windows via `reuse_root()` + `find_any` reuse + bounded `find_cbv()` for 64 KiB root CBVs and scaled default `VICTORY_ROOT_WINDOW_MB` to `16 MiB` on `<= 20 GiB` RAM PCs; tagged fingerprint algorithm in bit 1 (`recheck_fingerprint`, zero false re-uploads) and bounded aliased recheck (`1024 KiB` / `120` frames); rate-limited emergency `resource::let_go_idle()` in `heap_textures` to 1 s and timed the full pass against `VICTORY_TEXTURE_STAGE_MS`; pooled GPU-detile upload buffers (`SPARE_UPLOAD`, 32 MiB cap); added WDDM `NON_LOCAL` shared-memory pressure tracking (`shared_memory_pressure`) driving `ram_idle_ms`, `sweep()`, and pool trims (`SPARE`, `SPARE_UPLOAD`, `SPARE_LINEAR`, `texback::SPARE`, `shadow` pools, `list::IDLE`); and added serialized `reclaim_for_oom()` + 1-retry on `E_OUTOFMEMORY` across all D3D12 buffer/list/prelude allocators (zero shader-cache invalidation) |
 | **Low-graphics / potato mode (`VICTORY_LOW_GRAPHICS=1` / `2`)** | Full shadow cascades, mirror/planar/water/SSR reflections, world voxelization, volumetric fog/clouds, 1024 px textures and 16x anisotropy multiply draw count, VRAM usage, and CPU bind overhead on mid-range PCs | Added `VICTORY_LOW_GRAPHICS=1` (low) and `=2` (ultra-low/potato) skipping shadow-map rasterization (`CascadeShadows`, `PS_shadow`, `VS_shadow`, `ParaboloidShadows`), mirror/water/GBuffer/SSR reflections, voxel GI, puddle/glare/heat passes (and volumetric fog/clouds/blur in `=2`) while keeping main GBuffer, `ps_sky_paraboloid_reflection`, `PS_ShadowRender`, lighting, and UI intact; clamps `ambient.rs` reflections to `0.02` & disables depth occlusion; drops textures to `128 px` / `64 px` (`+1.5` / `+3.0` sampler LOD bias, 1x anisotropy, UI protected); and defaults display mode to `960x540` / `640x360` (zero shader-cache invalidation) |
-| **Wave 7: opt-in CPU cuts, still off (`VICTORY_HEAP_SKIP_TABLED`, `VICTORY_HEAP_SYNC_SKIP`, `VICTORY_HEAP_SYNC_BATCH`, `VICTORY_COPY_CHANGED_DIRECT`)** | After Wave 6 the draw calls `HostHeap::mirror` before the `tabled` stamp, so `changed` still feeds `heap_buffers`. `sync_heaps` still reads every dirty 64 KiB watch page. Card-resident `copy_changed` copied the CPU side into a scratch buffer that `copy_mapped` then overwrote | Four flags, each **default off** until a Windows frame line and a clean D3D12 Debug Layer run exist. `=1` drops tabled buffer slots from the once-per-frame `heap_buffers` pass, skips a dirty heap page whose slots are all left to draws, reads adjacent watch pages in 1 MiB chunks (per-page fallback), and fills the diff scratch from title memory. They do not change the default frame. Rebased onto Wave 6.5 / 6.6 / `VICTORY_LOW_GRAPHICS` |
+| **Wave 7: opt-in CPU cuts (`VICTORY_HEAP_SKIP_TABLED`, `VICTORY_HEAP_SYNC_SKIP`, `VICTORY_HEAP_SYNC_BATCH`, `VICTORY_COPY_CHANGED_DIRECT`)** | After Wave 6 the draw calls `HostHeap::mirror` before the `tabled` stamp, so `changed` still feeds `heap_buffers`. `sync_heaps` still reads every dirty 64 KiB watch page. Card-resident `copy_changed` copied the CPU side into a scratch buffer that `copy_mapped` then overwrote | Four flags, each **default off**. Live 2026-11-27 on this RX 6650 XT: all four `=1` with `VICTORY_LOW_GRAPHICS=1` + `VICTORY_FFX_SIMPLE=1` — boot/window/account-select held **30.0 fps** (`33.3 ms/frame`, `14` draws), frame lines showed the new `tabled slots not re-mirrored` / `pages not read` counters, **0 ERROR**, 0 device removals (~3.5 min). Stage 6 in-world with these flags not re-run (no controller past account select). Keep defaults off until an in-world frame + diagnostics Debug Layer run |
 
 ---
 
 ## Building & Running
 
-Requires Windows 10/11 x64, AVX2 CPU, D3D12 SM 6.6 + Mesh Shaders GPU, Rust (`1.98.1`, pinned in `rust-toolchain.toml`), MSVC C++ Build Tools, and [AMD FidelityFX SDK v2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases) for Series S + FSR mode. Shell below is **PowerShell** from `G:\GTA6\ruff-lab`.
+Requires Windows 10/11 x64, AVX2 CPU, D3D12 SM 6.6 + Mesh Shaders GPU, Rust (`1.98.1`, pinned in `rust-toolchain.toml`), MSVC C++ Build Tools, and [AMD FidelityFX SDK v2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases) for Series S + FSR — or `$env:VICTORY_FFX_SIMPLE = '1'` for bilinear upscale without the SDK. Shell below is **PowerShell** from `G:\GTA6\ruff-lab`.
 
 ```powershell
 cd G:\GTA6\ruff-lab
@@ -93,7 +93,7 @@ $env:VICTORY_SKIP_PIPELINES = (Get-Content docs\klbf\skip-amd.txt -Raw).Trim()
 .\target\release\victory.exe translate --cache --pipelines --jobs 8 'G:\GTA6\GTA6.Xbox.v1.0.2.1\shaders.rpf'
 ```
 
-Run (`--console series-s` + AMD FSR, tuned for 8 GB VRAM / 16 GB RAM + M.2 pagefile / 6C12T CPU; add `$env:VICTORY_FRAMEGEN = '1'` for AMD FSR Frame Generation; optional `$env:VICTORY_LOW_GRAPHICS = '1'` or `'2'` for low / potato mode):
+Run (`--console series-s`, tuned for **RX 6650 XT 8 GB / 32 GB RAM / Ryzen 5 8400F**; add `$env:VICTORY_FFX_DIR` for real FSR, or `$env:VICTORY_FFX_SIMPLE = '1'` without the SDK; optional `$env:VICTORY_LOW_GRAPHICS = '1'` or `'2'`; Wave 7 flags stay off unless set):
 
 ```powershell
 $game = 'G:\GTA6\GTA6.Xbox.v1.0.2.1'
@@ -128,7 +128,9 @@ $env:VICTORY_TEXTURE_KEEP_PERCENT = '78'
 $env:VICTORY_DYNAMIC_SLOTS = '524288'
 $env:VICTORY_DISPLAY_MODE = '1280x720'
 $env:VICTORY_AMBIENT_SHADE = '0'
-$env:VICTORY_FFX_DIR = '<FidelityFX SDK>\Kits\FidelityFX\signedbin'
+$env:VICTORY_FFX_SIMPLE = '1'
+# optional: $env:VICTORY_LOW_GRAPHICS = '1'
+# optional Wave 7 (default off): HEAP_SKIP_TABLED / HEAP_SYNC_SKIP / HEAP_SYNC_BATCH / COPY_CHANGED_DIRECT = '1'
 .\target\release\victory.exe run --console series-s "$game\game_scarlett_master.exe" --execute
 ```
 
