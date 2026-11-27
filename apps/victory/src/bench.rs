@@ -9,8 +9,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+#[cfg_attr(not(windows), allow(dead_code))]
+fn validate_frames(frames: u32) -> Result<()> {
+    anyhow::ensure!(frames > 0, "--frames must be > 0");
+    Ok(())
+}
+
 #[cfg(windows)]
 pub fn run(exe: &Path, frames: u32, out: Option<PathBuf>, set: Vec<String>) -> Result<()> {
+    validate_frames(frames)?;
     // Order per brief: apply_preset -> resolve_out -> ensure_pipelines ->
     // run::run. The resolved path is re-exported as VICTORY_BENCH_OUT
     // afterwards so the default (cache) location also reaches the GPU side,
@@ -220,11 +227,17 @@ fn ensure_pipelines(cfg: &victory_core::Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_preset, ensure_pipelines, parse_set_arg, resolve_out, wave9_key_events,
-        wave9_victory_keys,
+        apply_preset, ensure_pipelines, parse_set_arg, resolve_out, validate_frames,
+        wave9_key_events, wave9_victory_keys,
     };
     use std::path::{Path, PathBuf};
     use victory_core::Config;
+
+    #[test]
+    fn validate_frames_rejects_zero() {
+        assert!(validate_frames(0).is_err());
+        assert!(validate_frames(30).is_ok());
+    }
 
     #[test]
     fn parse_set_arg_parses_key_and_value() {

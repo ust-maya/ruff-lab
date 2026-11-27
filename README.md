@@ -169,6 +169,8 @@ cargo build --release -p victory
   without it the report lands in `<cache_dir>/bench/bench-<timestamp>.json`.
 - `--set KEY=VALUE` overrides preset defaults (repeatable); variables already
   set in the environment win over the preset but lose to `--set`.
+  `--set` wins for all vars except `VICTORY_BENCH_HEAVY`/`VICTORY_BENCH_OUT`,
+  where `--frames`/`--out` arguments win.
 - No fps/frame-time numbers are recorded here: a number belongs in
   `logs/results.md` only when captured on the target GPU (see AGENTS.md).
 
