@@ -47,6 +47,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
+#[cfg(windows)]
+mod port;
 pub mod preload;
 #[cfg(windows)]
 mod primitive;
