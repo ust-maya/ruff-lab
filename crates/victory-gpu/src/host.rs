@@ -884,6 +884,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prep_ahead_parses_only_1_on_true() {
+        for v in ["1", "on", "true", "ON", " True ", "1 "] {
+            assert!(parse_prep_ahead(v), "expected {v:?} to parse on");
+        }
+        for v in ["", "0", "off", "false", "2", "yes", "junk"] {
+            assert!(!parse_prep_ahead(v), "expected {v:?} to parse off");
+        }
+    }
+
+    #[test]
+    fn prep_ahead_effective_requires_late_and_relay() {
+        // Explicit 1 (requested) with late+relay effective: prep-ahead on.
+        assert!(prep_ahead_effective(true, true, true));
+        // Explicit 1 without late (or without relay): total no-op.
+        assert!(!prep_ahead_effective(true, false, true));
+        assert!(!prep_ahead_effective(true, true, false));
+        // Default off (not requested): off whatever late/relay say.
+        assert!(!prep_ahead_effective(false, true, true));
+        assert!(!prep_ahead_effective(false, false, false));
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -2586,6 +2608,38 @@ pub(crate) fn late_free_present() -> bool {
 pub(crate) fn relay() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| late_stage() > 0 && crate::shadow::relay())
+}
+
+/// Whether next-frame CPU preparation runs ahead of the GPU
+/// (`VICTORY_PREP_AHEAD=1`; off by default).
+///
+/// Flag plumbing only (the worker that uses it lands in a later task):
+/// effective only with [`late`] and [`relay`] — without both, preparation
+/// stays on the submitting thread and this is false, so the default path is
+/// a total no-op.
+#[allow(dead_code)] // used by the Task 3 overlap submit path
+pub(crate) fn prep_ahead() -> bool {
+    prep_ahead_effective(prep_ahead_flag(), late(), relay())
+}
+
+/// `VICTORY_PREP_AHEAD` as asked for (1/on/true), read once.
+#[allow(dead_code)] // used by `prep_ahead` above
+fn prep_ahead_flag() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PREP_AHEAD").is_ok_and(|v| parse_prep_ahead(&v)))
+}
+
+fn parse_prep_ahead(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "on" | "true"
+    )
+}
+
+/// Effective prep-ahead: only when asked for and both [`late`] and
+/// [`relay`] are on.
+fn prep_ahead_effective(requested: bool, late_on: bool, relay_on: bool) -> bool {
+    requested && late_on && relay_on
 }
 
 /// The relay's second stage (`VICTORY_RELAY=2`): a submission that reads
