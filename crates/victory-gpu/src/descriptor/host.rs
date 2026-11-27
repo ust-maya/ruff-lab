@@ -1911,7 +1911,12 @@ impl HostHeap {
     /// Marks title slot `index` as belonging to a per-draw descriptor table
     /// (buffers and CBVs) without touching the texture queue, so `sync_heaps`
     /// (`mirror_copied`) skips re-mirroring tens of thousands of per-draw
-    /// buffer/CBV slots every frame and feeding them into `heap_buffers`.
+    /// buffer/CBV slots every frame.
+    ///
+    /// The draw that stamps the slot has already called [`HostHeap::mirror`],
+    /// which notes the slot in `changed`. `heap_buffers` still walked that
+    /// set. `VICTORY_HEAP_SKIP_TABLED=1` drops those slots there;
+    /// [`HostHeap::left_to_draws`] is the same test `mirror_copied` uses.
     pub(crate) fn slot_tabled(&self, index: u32) {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(stamp) = self.tabled.get(index as usize) else {
@@ -1957,6 +1962,18 @@ impl HostHeap {
         let stamp = self.tabled_stamp(index) & !TABLED_READ;
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+    }
+
+    /// Slot `index` is left to the draws that read it through a table, the
+    /// same test as [`HostHeap::mirror_copied`]. Sampler heaps and
+    /// `VICTORY_HEAP_SYNC_TABLES=1` never say so.
+    pub(crate) fn left_to_draws(&self, index: u32) -> bool {
+        !self.sampler && !sync_tables() && self.tabled_lately(index, crate::frame::current())
+    }
+
+    /// Every host slot in `first..last` is [`HostHeap::left_to_draws`].
+    pub(crate) fn records_left_to_draws(&self, first: u32, last: u32) -> bool {
+        first < last && (first..last).all(|index| self.left_to_draws(index))
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.

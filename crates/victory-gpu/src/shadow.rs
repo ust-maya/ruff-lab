@@ -1922,6 +1922,24 @@ fn copy_changed() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_CHANGED").is_none_or(|v| v != "0"))
 }
 
+/// Whether the diff scratch in [`Shadow::copy`] is filled from title memory
+/// directly (`VICTORY_COPY_CHANGED_DIRECT=1`; off by default).
+///
+/// The scratch used to be a copy of the CPU side that `copy_mapped` then
+/// replaced in full: one extra memcpy of every 2 MiB chunk. Off, that copy
+/// stays, which `VICTORY_COPY_MODE=none` also needs (it writes nothing, so
+/// the compare must still see the CPU side).
+fn copy_changed_direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() == 2 {
+            return false;
+        }
+        std::env::var_os("VICTORY_COPY_CHANGED_DIRECT").is_some_and(|v| v == "1")
+    })
+}
+
 /// Whether `Shadow::merge_under_writes` widens byte runs to aligned 32-bit
 /// words before queueing card uploads (`VICTORY_UNDER_WRITES_WORDS`, default
 /// ON; `0` disables).
@@ -3421,13 +3439,26 @@ impl Shadow {
                 let mut first_dirty: Option<usize> = None;
                 let mut last_dirty = 0usize;
                 let mut off = 0usize;
+                let direct = copy_changed_direct();
                 while off < total {
                     let n = CHUNK.min(total - off);
                     // SAFETY: `[from + off, from + off + n)` lies inside the CPU-side
                     // mapping; ranges shaders are writing were excluded by `update`.
                     let held = unsafe { std::slice::from_raw_parts_mut(at.add(off), n) };
-                    title.clear();
-                    title.extend_from_slice(held);
+                    if direct {
+                        // `copy_mapped` overwrites every byte of the scratch (zeros
+                        // where title memory is unmapped) before the compare. Seeding
+                        // it from the CPU side was a second full copy of the chunk.
+                        if title.capacity() < n {
+                            title.reserve(n);
+                        }
+                        // SAFETY: `n` bytes are written by `copy_mapped` below before
+                        // any read. `VICTORY_COPY_MODE=none` does not take this branch.
+                        unsafe { title.set_len(n) };
+                    } else {
+                        title.clear();
+                        title.extend_from_slice(held);
+                    }
                     crate::host::copy_mapped(title.as_mut_ptr(), (from + off) as *const u8, n, false);
                     let runs = changed_spans(&title, held);
                     for &(r, m) in &runs {

@@ -6,7 +6,7 @@ Instructions for coding agents. Build and run steps are in `README.md`. The asse
 
 This is a Rust workspace (`edition` 2024, `rust-version` 1.88). The toolchain is Windows-only: `rust-toolchain.toml` pins `1.98.1` and `x86_64-pc-windows-msvc`. `victory-gpu` and `victory-hle` are `#[cfg(windows)]`. A Linux `cargo check` does not link them and is not a green GPU run.
 
-Do not write a frame time, an fps number, or a "passed" row into `logs/results.md` or `README.md` unless that frame was captured on the target GPU. The README's reference card is an RX 6600 XT, with a clean D3D12 Debug Layer run.
+Do not write a frame time, an fps number, or a "passed" row into `logs/results.md` or `README.md` unless that frame was captured on the target GPU. This host's reference card is an **RX 6650 XT 8 GB** (Ryzen 5 8400F, 32 GB RAM, Windows 11 `10.0.26300`); older log rows may still mention RX 6600 XT / 16 GB from prior machines.
 
 ## What CI actually runs
 
