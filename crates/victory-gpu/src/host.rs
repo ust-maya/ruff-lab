@@ -1,12 +1,14 @@
-//! The host GPU: one D3D12 device and direct queue (decision 0007), and a
-//! window to present on.
+//! The host GPU: one D3D12 device, a direct queue, and a copy queue for
+//! dirty pages (decision 0007), and a window to present on.
 //!
 //! shortcut: every submission is waited for, so CPU and GPU never overlap
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+mod copyeng;
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -57,6 +59,22 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// DMA of dirty pages. `None` when the device could not make a copy queue.
+    copy_queue: Option<ID3D12CommandQueue>,
+    copy_fence: Option<ID3D12Fence>,
+    /// Signalled on the direct queue so a copy starts after draws already queued.
+    hand_fence: Option<ID3D12Fence>,
+    /// Last value published on `copy_fence`.
+    copy_next: AtomicU64,
+    copy_engine: Mutex<Option<copyeng::Engine>>,
+    /// The direct fence value we are waiting on, and when it was armed.
+    fence_watch: Mutex<FenceWatch>,
+}
+
+struct FenceWatch {
+    value: u64,
+    at_us: u64,
+    fired: bool,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -655,6 +673,17 @@ fn create() -> windows::core::Result<Host> {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
         })?;
+        let copy_queue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                ..Default::default()
+            })
+            .ok();
+        let copy_fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok();
+        let hand_fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok();
+        let (rebar_l1, rebar_bytes) = copyeng::probe(&device);
+        crate::loopcut::set_rebar_probe(rebar_l1, rebar_bytes);
+        tracing::info!(l1 = rebar_l1, bytes = rebar_bytes, copy = copy_queue.is_some(), "resizable BAR probe");
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -690,6 +719,12 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            copy_queue,
+            copy_fence,
+            hand_fence,
+            copy_next: AtomicU64::new(0),
+            copy_engine: Mutex::new(None),
+            fence_watch: Mutex::new(FenceWatch { value: 0, at_us: 0, fired: false }),
         })
     }
 }
@@ -2165,6 +2200,8 @@ struct CardPlan {
     inflight_landed: u32,
     /// Mask buffer used by this plan's masked upload pass (`card_done` recycles it).
     masks: Option<(ID3D12Resource, usize, u64)>,
+    /// Upload buffers and one-shot lists the copy queue is still reading.
+    hold: copyeng::Hold,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3902,6 +3939,54 @@ impl Host {
         }
     }
 
+    /// Dirty pages go to the copy queue (`VICTORY_DIRTY_RING=0` keeps them
+    /// on the direct queue).
+    pub(crate) fn copy_offload_on(&self) -> bool {
+        crate::loopcut::dirty_ring()
+            && self.copy_queue.is_some()
+            && self.copy_fence.is_some()
+            && self.hand_fence.is_some()
+    }
+
+    pub(crate) fn kick_copy(&self, shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        copyeng::kick(self, shadow, from, to);
+    }
+
+    fn arm_fence(&self, value: u64) {
+        let mut watch = self.fence_watch.lock().unwrap_or_else(|e| e.into_inner());
+        watch.value = value;
+        watch.at_us = now_us();
+        watch.fired = false;
+    }
+
+    /// Logs a direct-queue fence that has not completed. Does not end the process.
+    fn poke_fence(&self) {
+        let mut watch = self.fence_watch.lock().unwrap_or_else(|e| e.into_inner());
+        if watch.value == 0 || watch.fired {
+            return;
+        }
+        // SAFETY: the fence is ours.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed >= watch.value {
+            return;
+        }
+        if !crate::loopcut::watchdog_due(now_us(), watch.at_us, crate::loopcut::fence_timeout_us()) {
+            return;
+        }
+        watch.fired = true;
+        drop(watch);
+        crate::loopcut::note_watchdog();
+        // SAFETY: a query. A removed device is logged here and left to the
+        // caller that hit the failing call; this path does not terminate.
+        let reason = unsafe { self.device.GetDeviceRemovedReason() };
+        let dred = self.removal_data(&[]);
+        tracing::error!(
+            ?reason,
+            list = %crate::loopcut::last_list(),
+            "{dred}; direct fence timed out (VICTORY_FENCE_TIMEOUT_MS)"
+        );
+    }
+
     /// Before a submission's lists run, for copies in the card's memory
     /// ([`crate::shadow::cards`]): what changed on their CPU side since
     /// the last submission goes to their card side (a list of ours, run
@@ -3969,6 +4054,7 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut masks: Option<(ID3D12Resource, usize, u64)> = None;
+        let mut copy_hold = copyeng::Hold::empty();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -3976,7 +4062,7 @@ impl Host {
             let (allocator, list) = &sync;
             type Sends = (Vec<(usize, usize)>, Vec<(usize, usize)>);
             let mut sends: Vec<Sends> = dirty.iter().map(|(_, ranges)| (ranges.clone(), Vec::new())).collect();
-            if work.patch.is_some() {
+            if work.patch.is_some() && !self.copy_offload_on() {
                 let split: Vec<_> = dirty
                     .iter()
                     .map(|(_, ranges)| masked_blocks(ranges, masks_least()))
@@ -4029,6 +4115,15 @@ impl Host {
                     }
                 }
             }
+            if self.copy_offload_on() {
+                copyeng::begin_submit();
+                let mut direct: Vec<Vec<(usize, usize)>> = sends.iter().map(|(copies, _)| copies.clone()).collect();
+                copy_hold = copyeng::offload(self, &dirty, &mut direct);
+                for (send, left) in sends.iter_mut().zip(direct) {
+                    send.0 = left;
+                    send.1.clear();
+                }
+            }
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
@@ -4054,7 +4149,15 @@ impl Host {
                             Ordering::Relaxed,
                         );
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
-                        let mut state = (!copies.is_empty()).then_some(D3D12_RESOURCE_STATE_COPY_DEST);
+                        let mut state = if !copies.is_empty() {
+                            Some(D3D12_RESOURCE_STATE_COPY_DEST)
+                        } else if self.copy_offload_on() && !ranges.is_empty() {
+                            // The copy queue left the buffer in COMMON. Decay
+                            // would too; the barrier below names that state.
+                            Some(D3D12_RESOURCE_STATE_COMMON)
+                        } else {
+                            None
+                        };
                         if let (false, Some((root, pso)), Some((mask_buffer, _, _))) =
                             (masked.is_empty(), work.patch.as_ref(), masks.as_ref())
                         {
@@ -4129,6 +4232,9 @@ impl Host {
             if let Err(e) = recorded {
                 fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
             }
+            if self.copy_offload_on() {
+                copyeng::end_window();
+            }
             used.push((false, sync));
         }
         drop(order);
@@ -4141,6 +4247,7 @@ impl Host {
             inflight: false,
             inflight_landed: 0,
             masks,
+            hold: copy_hold,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -4272,6 +4379,8 @@ impl Host {
     /// when nothing of ours is on the card, so the compare's results start
     /// from the beginning again.
     fn card_done(&self, plan: CardPlan) {
+        // Copy-queue uploads stay alive until the direct queue has finished this plan.
+        let _hold = plan.hold;
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
@@ -5139,6 +5248,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.poke_fence();
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -5261,20 +5371,26 @@ impl Host {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
+        crate::loopcut::note_prep((prepared - started).saturating_sub(settled).as_micros() as u64);
+        crate::loopcut::note_list(format!("submission {this_submission}, {} lists", runs.len()));
         if late {
             *submitted += 1;
-            // SAFETY: closed lists; the fence is ours.
+            // SAFETY: closed lists; the fence is ours. The copy fence is
+            // waited on the GPU, not on this thread.
             let signalled = unsafe {
+                copyeng::wait_on_direct(self);
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            self.arm_fence(*submitted);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
+            crate::loopcut::end_submit();
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
@@ -5306,16 +5422,19 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                copyeng::wait_on_direct(self);
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                self.arm_fence(*submitted);
                 match waited {
                     Ok(()) => {
                         working(false);
                         WaitForSingleObject(self.event, INFINITE);
+                        crate::loopcut::note_submit_wait(started.elapsed().as_micros() as u64);
                         stood(started);
                         working(true);
                     }
@@ -5428,6 +5547,7 @@ impl Host {
         if relay() {
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
         }
+        crate::loopcut::end_submit();
         working(was_working);
         None
     }
@@ -7621,6 +7741,8 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            #[cfg(not(feature = "diagnostics"))]
+            tracing::info!("{}", crate::loopcut::take_line(frames));
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

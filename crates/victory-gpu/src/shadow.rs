@@ -283,6 +283,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         // 32nd.
         let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
+        crate::loopcut::note_l0();
         if n <= 64 || n.is_multiple_of(32) {
             tracing::info!(
                 "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
@@ -302,11 +303,13 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        crate::loopcut::note_l0();
         return None;
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        crate::loopcut::note_l0();
     }
     buffer
 }
@@ -353,15 +356,18 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        crate::loopcut::note_l0();
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        crate::loopcut::note_l0();
         return None;
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        crate::loopcut::note_l0();
     }
     buffer
 }
@@ -3238,6 +3244,11 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
+                if self.card.is_some() && written.is_empty() && self.range_uploaded(from, to) {
+                    crate::loopcut::note_immutable((to - from) as u64);
+                    self.refresh_check(from, to);
+                    return 0;
+                }
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
@@ -3384,6 +3395,9 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        if self.card.is_some() && crate::loopcut::dirty_ring() {
+            return self.copy_dirty_pages(from, to);
+        }
         if self.card.is_some() && copy_changed() {
             // Scan in 2 MiB chunks so large unwatched ping-pong buffers (>16 MiB,
             // e.g. 21 MiB) also diff-upload only changed spans instead of
@@ -3424,6 +3438,7 @@ impl Shadow {
                 if let Some(first) = first_dirty {
                     self.changed(first, last_dirty);
                 }
+                crate::loopcut::note_copy(copied_bytes as u64);
                 copied_bytes
             });
         }
@@ -3431,7 +3446,98 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        crate::loopcut::note_copy((to - from) as u64);
         to - from
+    }
+
+    /// Every 64 KiB page overlapping `[from, to)` has been copied at least once.
+    fn range_uploaded(&self, from: usize, to: usize) -> bool {
+        if from >= to {
+            return true;
+        }
+        let base = self.start as usize / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let last = (to - 1) / PAGE;
+        (from / PAGE..=last).all(|page| copied.get(page - base).copied().unwrap_or(0) != 0)
+    }
+
+    /// Card-resident `[from, to)` (title addresses): only 4 KiB pages the
+    /// kernel marked, and nothing a DirectStorage landing already absorbed.
+    fn copy_dirty_pages(&self, from: usize, to: usize) -> usize {
+        let gaps = crate::loopcut::subtract_covered(from, to, &crate::loopcut::covers());
+        let mut bytes = 0;
+        for (a, b) in gaps {
+            bytes += self.absorb_dirty(a, b);
+        }
+        bytes
+    }
+
+    /// Copies `[from, to)` into the CPU side. A range already uploaded is
+    /// cut down to the kernel's 4 KiB pages when that answer accounts for
+    /// every stale page. Our own writes (`watch::wrote`) are not in that
+    /// answer, so those ranges stay whole.
+    fn absorb_dirty(&self, from: usize, to: usize) -> usize {
+        let runs = if self.range_uploaded(from, to) && crate::watch::kernel_covers_journal(from, to) {
+            let pages = crate::watch::kernel_pages_in(from, to).unwrap_or_default();
+            let runs = crate::loopcut::coalesce_pages(from, to, &pages);
+            if runs.is_empty() { vec![(from, to)] } else { runs }
+        } else {
+            vec![(from, to)]
+        };
+        let mut bytes = 0;
+        for (a, b) in runs {
+            bytes += self.absorb_abs(a, b);
+        }
+        bytes
+    }
+
+    /// Copies title bytes `[from, to)` into the CPU side and marks that
+    /// offset range dirty for the card side. Both are title addresses.
+    fn absorb_abs(&self, from: usize, to: usize) -> usize {
+        let start = self.start as usize;
+        if from >= to || from < start {
+            return 0;
+        }
+        let (from, to) = (from, to.min((self.start + self.len) as usize));
+        if from >= to {
+            return 0;
+        }
+        // SAFETY: `[from, to)` lies in the buffer, so it lies in the mapping.
+        let at = unsafe { self.data.add(from - start) };
+        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        self.changed(from - start, to - start);
+        self.card_changed(from - start, to - start);
+        crate::loopcut::note_copy((to - from) as u64);
+        to - from
+    }
+
+    /// Drops `[from, to)` from the card-side dirty list. The copy queue
+    /// already has those bytes; the next submit must not send them again.
+    pub(crate) fn unmark_card(&self, from: usize, to: usize) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if from >= to {
+            return;
+        }
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::mem::take(&mut *dirty);
+        for (a, b) in old {
+            if b <= from || a >= to {
+                dirty.push((a, b));
+                continue;
+            }
+            if a < from {
+                dirty.push((a, from));
+            }
+            if to < b {
+                dirty.push((to, b));
+            }
+        }
+    }
+
+    pub(crate) fn staging_ptr(&self) -> *const u8 {
+        self.data
     }
 
     /// Whether shaders read and write this copy in the card's own memory
@@ -3687,6 +3793,38 @@ impl Shadow {
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         crate::watch::note_landed(start + at, n);
         n
+    }
+}
+
+/// DirectStorage wrote `[address, address + len)`. When that is a
+/// card-resident copy, the bytes are absorbed once and handed to the copy
+/// queue; the submit that follows does not copy them again.
+pub(crate) fn stream_landed(address: usize, len: usize) {
+    if len == 0 || !crate::loopcut::dirty_ring() {
+        return;
+    }
+    let Some(shadow) = find(address as u64, len as u64) else {
+        return;
+    };
+    if !shadow.carded() {
+        return;
+    }
+    let start = shadow.start as usize;
+    let end = (shadow.start + shadow.len) as usize;
+    let from = address.max(start);
+    let to = address.saturating_add(len).min(end);
+    if from >= to {
+        return;
+    }
+    let n = shadow.absorb_abs(from, to);
+    if n == 0 {
+        return;
+    }
+    crate::loopcut::cover_stream(from, to);
+    crate::loopcut::note_stream(n as u64);
+    if let Some(host) = host() {
+        let off = from - start;
+        host.kick_copy(&shadow, off, off + n);
     }
 }
 

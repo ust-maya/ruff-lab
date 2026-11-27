@@ -133,6 +133,11 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// 4 KiB pages the latest kernel answer reported, and that answer's
+    /// number. Cleared when a newer answer arrives. Folded 64 KiB pages in
+    /// `written` stay the record of what was ever seen.
+    kernel_now: u64,
+    kernel_pages: Vec<usize>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -142,6 +147,8 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    kernel_now: 0,
+    kernel_pages: Vec::new(),
 });
 
 /// Ranges of one submission closer than this are asked about together:
@@ -367,11 +374,68 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
+    let addrs: Vec<usize> = j.found[..count].to_vec();
+    remember_kernel(j, now, &addrs);
+    for addr in addrs {
+        j.written.insert(addr / PAGE, now);
     }
     true
+}
+
+/// Keeps the 4 KiB pages `addrs` (kernel answers) under asking `now`.
+fn remember_kernel(j: &mut Journal, now: u64, addrs: &[usize]) {
+    if j.kernel_now != now {
+        j.kernel_now = now;
+        j.kernel_pages.clear();
+    }
+    j.kernel_pages.extend(addrs.iter().map(|a| a & !4095));
+    crate::loopcut::note_watched(addrs.len() as u64);
+}
+
+/// The 64 KiB journal pages in `[start, end)` were all written by the latest
+/// kernel answer, and each overlaps one of that answer's 4 KiB pages.
+/// False when a later note (`wrote`) or an older asking sits in the range:
+/// the caller then copies the range whole.
+pub(crate) fn kernel_covers_journal(start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if j.kernel_now == 0 || j.kernel_pages.is_empty() {
+        return false;
+    }
+    let now = j.kernel_now;
+    let first = start / PAGE;
+    let last = (end - 1) / PAGE;
+    for page in first..=last {
+        match j.written.get(&page).copied() {
+            Some(when) if when == now => {
+                let lo = page * PAGE;
+                let hi = lo + PAGE;
+                if !j.kernel_pages.iter().any(|&p| p < hi && p.saturating_add(KERNEL_PAGE) > lo) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// 4 KiB pages inside `[start, end)` from the latest kernel answer.
+/// `None` when no answer has been recorded yet.
+pub(crate) fn kernel_pages_in(start: usize, end: usize) -> Option<Vec<usize>> {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if j.kernel_now == 0 {
+        return None;
+    }
+    Some(
+        j.kernel_pages
+            .iter()
+            .copied()
+            .filter(|&p| p < end && p.saturating_add(4096) > start)
+            .collect(),
+    )
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -469,7 +533,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+    let addrs: Vec<usize> = j.found[..count].to_vec();
+    remember_kernel(j, now, &addrs);
+    let pages = addrs.iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
@@ -1336,6 +1402,7 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1) {
+            crate::loopcut::note_fault();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;

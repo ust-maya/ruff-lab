@@ -40,6 +40,7 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+mod loopcut;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
@@ -78,3 +79,13 @@ pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// DirectStorage finished writing `[address, address + len)` of title memory.
+/// A card-resident copy of that range is queued to the copy engine once;
+/// the next submit does not copy those bytes again.
+pub fn stream_landed(address: usize, len: usize) {
+    #[cfg(windows)]
+    crate::shadow::stream_landed(address, len);
+    #[cfg(not(windows))]
+    let _ = (address, len);
+}

@@ -1276,6 +1276,9 @@ fn into_destination(
         // read was under way took what was there before. Counted; acted on
         // only with `VICTORY_PAGE_WRITES=all`.
         victory_gpu::title_memory_written(request.destination as usize, len, false);
+        if filled.is_ok() {
+            victory_gpu::stream_landed(request.destination as usize, len);
+        }
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;

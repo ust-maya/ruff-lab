@@ -679,6 +679,7 @@ impl PageRuns {
         }
         for (at, bytes) in merged(pieces) {
             victory_gpu::title_memory_written(at, bytes, true);
+            victory_gpu::stream_landed(at, bytes);
         }
     }
 

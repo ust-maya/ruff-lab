@@ -1680,15 +1680,17 @@ impl State {
         if pass == 0 {
             ranges.clear();
             slots = host.buffer_slots();
-        } else {
-            let slice_idx = (pass % rescan) as usize;
-            let part = host.buffer_slots_part(slice_idx, rescan as usize);
+        } else if crate::loopcut::rescan_this_pass(pass, rescan) {
+            // Background full walk, not a slice of every hot frame. The
+            // slots written since the last pass (`buffer_changes`) are the
+            // whole hot-frame set.
+            let part = host.buffer_slots();
             if !part.is_empty() {
                 slots.extend_from_slice(&part);
                 slots.sort_unstable();
                 slots.dedup();
             }
-            if slice_idx == 0 && !ranges.is_empty() {
+            if !ranges.is_empty() {
                 ranges.retain(|&k, _| host.has_buffer_slot(k));
             }
         }
@@ -1845,7 +1847,9 @@ impl State {
         self.preload_or_heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
-        HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let micros = started.elapsed().as_micros() as u64;
+        HEAP_BUFFER_MICROS.fetch_add(micros, Ordering::Relaxed);
+        crate::loopcut::note_descriptor(micros);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
         let seen = LOGGED.load(Ordering::Relaxed);

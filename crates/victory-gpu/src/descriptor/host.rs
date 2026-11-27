@@ -88,6 +88,8 @@ impl Slots {
 
     /// Returns all set slots with `slot % parts == which`, masking out
     /// unrelated bits before scanning (`kitty-core/Kitty6` `ab9f1b7`).
+    /// Hot frames no longer take a slice; the full walk is the background pass.
+    #[allow(dead_code)]
     fn part_of(&self, which: usize, parts: usize) -> Vec<u32> {
         if parts <= 1 {
             return self.all();
@@ -2006,6 +2008,8 @@ impl HostHeap {
 
     /// Rotating `which`-th slice of `parts` of the title slots holding buffer
     /// views, scanned lock-free with bit masking (`kitty-core/Kitty6` `ab9f1b7`).
+    /// Hot frames no longer take a slice; the full walk is the background pass.
+    #[allow(dead_code)]
     pub(crate) fn buffer_slots_part(&self, which: usize, parts: usize) -> Vec<u32> {
         self.buffers.part_of(which, parts)
     }

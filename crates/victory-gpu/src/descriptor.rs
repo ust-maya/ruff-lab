@@ -261,7 +261,9 @@ pub(crate) fn sync_heaps() {
         }
     }
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
+    let micros = started.elapsed().as_micros() as u64;
+    crate::loopcut::note_descriptor(micros);
+    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros]) {
         count.fetch_add(n, Relaxed);
     }
 }
