@@ -6530,6 +6530,12 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        // Into write-combined title memory: the card keeps it, nothing is
+        // declared (`VICTORY_WC_NO_BACK`).
+        if crate::wc::skip_back(address, len, shadow.carded(), shadow.watched_known()) {
+            shadow.card_owns(address, len);
+            return;
+        }
         static ONCE: OnceLock<bool> = OnceLock::new();
         let dedup = *ONCE.get_or_init(|| {
             std::env::var("VICTORY_DECLARE_ONCE").map_or(true, |v| v != "0")
@@ -7636,6 +7642,7 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        let wc_sample = crate::wc::take(frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -7819,6 +7826,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            crate::wc::log(wc_sample);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
