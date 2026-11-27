@@ -145,6 +145,43 @@ $env:VICTORY_FFX_SIMPLE = '1'
 
 ---
 
+## Bench
+
+`victory bench` is a thin wrapper over `run --execute --console series-s` for
+reproducible A/B measurements. It applies the Wave 9 shared preset (only for
+variables still unset), generates scripted `VICTORY_KEYS` input, checks that
+the pipeline cache is warm, and stops after N qualifying heavy samples
+(`draws>=2500 && ms<=2000`). The GPU side writes a `victory-bench/v1` JSON
+report outside the repository and exits the process; no manual kill is needed.
+
+Prerequisite: warm the pipeline cache first (`translate --cache --pipelines`,
+see above) — otherwise the bench run fails with
+`run translate --cache --pipelines first`.
+
+```powershell
+cargo build --release -p victory
+.\target\release\victory.exe bench 'G:\GTA6\GTA6.Xbox.v1.0.2.1\game_scarlett_master.exe' --frames 30
+.\target\release\victory.exe bench 'G:\GTA6\GTA6.Xbox.v1.0.2.1\game_scarlett_master.exe' --frames 30 --out 'C:\bench\result.json' --set VICTORY_LOW_GRAPHICS=2
+```
+
+- `--frames 30` (default) counts qualifying heavy samples, not total frames.
+- `--out <path>` writes the JSON there (must be outside the repository);
+  without it the report lands in `<cache_dir>/bench/bench-<timestamp>.json`.
+- `--set KEY=VALUE` overrides preset defaults (repeatable); variables already
+  set in the environment win over the preset but lose to `--set`.
+- No fps/frame-time numbers are recorded here: a number belongs in
+  `logs/results.md` only when captured on the target GPU (see AGENTS.md).
+
+Subsystem microbenchmarks (ignored tests, release build):
+
+```powershell
+cargo test --release -p victory-gpu --lib -- --ignored bench_mirror --nocapture
+cargo test --release -p victory-shader bitcode -- --ignored --nocapture
+cargo test --release -p victory-formats -- --ignored --nocapture
+```
+
+---
+
 ## Credits & License
 
 - [Marvisak/VIctory](https://github.com/Marvisak/VIctory) — original Xbox Series X|S compatibility runtime for Windows.

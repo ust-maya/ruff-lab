@@ -1,13 +1,35 @@
-//! `victory bench`: benchmark skeleton. Task 1 only wires the CLI and the
-//! `--set KEY=VALUE` parser; the actual measurement lands later.
+//! `victory bench`: reproducible benchmark wrapper over `run::run`.
+//!
+//! Applies the Wave 9 preset, resolves the bench JSON path outside the
+//! repository, asserts the pipeline cache is warm, then launches the title
+//! with `VICTORY_BENCH_HEAVY` set; the GPU side counts qualifying heavy
+//! samples, writes the JSON and exits the process.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
 #[cfg(windows)]
-pub fn run(_exe: &Path, _frames: u32, _out: Option<PathBuf>, _set: Vec<String>) -> Result<()> {
-    anyhow::bail!("benchmarking not implemented yet")
+pub fn run(exe: &Path, frames: u32, out: Option<PathBuf>, set: Vec<String>) -> Result<()> {
+    // Order per brief: apply_preset -> resolve_out -> ensure_pipelines ->
+    // run::run. The resolved path is re-exported as VICTORY_BENCH_OUT
+    // afterwards so the default (cache) location also reaches the GPU side,
+    // which reads only that variable.
+    apply_preset(&set, frames, out.as_deref())?;
+    let cfg = victory_core::Config::load()?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or_else(|_| "0".to_owned(), |d| d.as_secs().to_string());
+    let resolved = resolve_out(&cfg, out, ts)?;
+    set_env("VICTORY_BENCH_OUT", &resolved.to_string_lossy());
+    ensure_pipelines(&cfg)?;
+    crate::run::run(
+        exe,
+        crate::Unimplemented::Trap,
+        false,
+        true,
+        crate::Console::SeriesS,
+    )
 }
 
 #[cfg(not(windows))]
@@ -16,8 +38,7 @@ pub fn run(_: &Path, _: u32, _: Option<PathBuf>, _: Vec<String>) -> Result<()> {
 }
 
 /// Parse one `--set KEY=VALUE` argument into its key and value.
-/// Only the tests use it for now; the bench run wires it up later.
-#[allow(dead_code)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn parse_set_arg(s: &str) -> Result<(String, String)> {
     let (key, value) = s
         .split_once('=')
@@ -32,7 +53,7 @@ pub fn parse_set_arg(s: &str) -> Result<(String, String)> {
 /// `VICTORY_IDLE_LISTS`, `VICTORY_LIST_CEILING`, `VICTORY_LIBRARY_STORE_LATER`
 /// and the four Wave 7 `VICTORY_HEAP_*` flags — they stay unset unless the
 /// user passes them via `--set`.
-#[allow(dead_code)]
+#[cfg_attr(not(windows), allow(dead_code))]
 const PRESET: &[(&str, &str)] = &[
     ("VICTORY_FFX_SIMPLE", "1"),
     ("VICTORY_LOW_GRAPHICS", "1"),
@@ -92,7 +113,7 @@ fn wave9_key_events(end_s: u32) -> Vec<(f64, &'static str)> {
 /// Renders [`wave9_key_events`] as the `<sec>:<key>,...` list consumed by
 /// `VICTORY_KEYS` (read opaquely by `gameinput.rs` `scripted()`). Formatted
 /// with integer math only: `t as f64 + 0.4` would render `35.400000...`.
-#[allow(dead_code)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn wave9_victory_keys(end_s: u32) -> String {
     let mut parts = Vec::new();
     for t in 3..=end_s {
@@ -111,7 +132,7 @@ pub fn wave9_victory_keys(end_s: u32) -> String {
 /// SAFETY: called single-threaded from `bench::run` before any game process
 /// is spawned (before `run.rs` spawns the title), so no other thread can
 /// observe a racing read/write of these variables.
-#[allow(dead_code)]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn set_env(key: &str, value: &str) {
     // SAFETY: see the doc comment above — no spawn and no concurrent access.
     unsafe { std::env::set_var(key, value) }
@@ -122,7 +143,7 @@ fn set_env(key: &str, value: &str) {
 /// KEY=VALUE` override both the defaults and the environment, and always sets
 /// `VICTORY_BENCH_HEAVY` from `frames` (and `VICTORY_BENCH_OUT` when an output
 /// path is given). Must run before any spawn of the game process.
-#[allow(dead_code)]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn apply_preset(set: &[String], frames: u32, out: Option<&Path>) -> Result<()> {
     let mut overrides = Vec::new();
     for arg in set {
@@ -169,7 +190,7 @@ fn apply_preset(set: &[String], frames: u32, out: Option<&Path>) -> Result<()> {
 /// Without an explicit `--out` this is `cfg.cache_subdir("bench")/bench-<ts>.json`
 /// (created by `cache_subdir`). An explicit path must pass the asset policy
 /// first — anything inside the repository is refused with a clear error.
-#[allow(dead_code)]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn resolve_out(cfg: &victory_core::Config, out: Option<PathBuf>, ts: String) -> Result<PathBuf> {
     if let Some(out) = out {
         victory_core::ensure_outside_repo(&out)?;
@@ -183,7 +204,7 @@ fn resolve_out(cfg: &victory_core::Config, out: Option<PathBuf>, ts: String) -> 
 /// `pipelines/<SOURCE_HASH>/` directory under every `Config` cache must exist.
 /// The check does not create the directory — a missing cache means the user
 /// still has to run the prebuild first.
-#[allow(dead_code)]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn ensure_pipelines(cfg: &victory_core::Config) -> Result<()> {
     let dir = cfg
         .cache_dir
