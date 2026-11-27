@@ -1,0 +1,24 @@
+---
+description: Rust platform, Windows toolchain, and verification rules for ruff-lab
+alwaysApply: true
+---
+
+# Platform
+
+- Rust workspace, edition 2024, `rust-version` 1.88. Toolchain is Windows-only: `rust-toolchain.toml` pins `1.98.1` + `x86_64-pc-windows-msvc`.
+- `victory-gpu` and `victory-hle` are `#[cfg(windows)]`. A Linux `cargo check` is not a green GPU run.
+- Do not write frame time, fps, or a "passed" row into `logs/results.md` / `README.md` unless captured on the target GPU (RX 6650 XT 8 GB).
+
+# CI before claiming green
+
+```
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+# Style
+
+- `rustfmt.toml`: `max_width` 100. CI denies clippy warnings.
+- LF everywhere except CRLF for `*.cmd` / `*.ps1`.
+- Release is slow (`lto = "thin"`, `codegen-units = 1`). Prefer profile `diag` for diagnostics builds.

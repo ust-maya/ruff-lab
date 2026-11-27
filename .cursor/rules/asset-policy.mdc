@@ -1,0 +1,13 @@
+---
+description: Asset policy — no game files, dumps, or proprietary data in the repo
+alwaysApply: true
+---
+
+# Asset policy
+
+- Never commit game files, dumps, shader dumps, screenshots, or `victory.toml`.
+- Paths live outside the repo. `.victory-root` + `victory_core::ensure_outside_repo` refuse derived data inside the tree.
+- Check with `cargo xtask policy`. New extension → entry in `xtask/src/policy.rs`.
+- Allowlist: `rs`, `toml`, `md`, `mdc`, `txt`, `lock`, `yml`, `yaml`, `json`, `hlsl`, `hlsli`, `ps1`, `cmd`, `sh`, `svg`; under 512 KiB; no NUL / binary magic; no hex/base64 run > 512 chars.
+- Only binary exception: `crates/victory-formats/src/bcpack-tables.bin`.
+- Do not put title bytes into literals or fixtures. Real-file tests use `VICTORY_GAME_DIR`, `VICTORY_CONSOLE_DXC`, `VICTORY_PC_DXC`, `VICTORY_WARP` and skip when unset.

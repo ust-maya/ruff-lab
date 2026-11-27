@@ -1,0 +1,14 @@
+---
+description: Where code belongs and how behavior changes land
+alwaysApply: true
+---
+
+# Where code goes
+
+- `crates/victory-game` = title (offsets, signatures, containers).
+- Every other crate = platform. Keep title-specific bytes out of platform crates.
+
+# Changing behavior
+
+- Leave the default path alone. New speedups are flags that default to the old path until there is a captured frame and a clean D3D12 Debug Layer run.
+- Do not replace the incremental `heap_buffers` walk (`VICTORY_HEAP_RESCAN_FRAMES`, rotating 1/N slice) with a full scan.

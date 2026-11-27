@@ -1,0 +1,20 @@
+---
+description: Conventional Commits and Conventional Branch naming
+alwaysApply: true
+---
+
+# Commits
+
+Conventional Commits: `<type>[optional scope][!]: <description>`
+
+- Types: `feat`, `fix`, `perf`, `docs`, `refactor`, `test`, `build`, `ci`, `chore`.
+- Subject: lowercase, no trailing period.
+- Note in the body when the change was not run on Windows.
+
+# Branches
+
+Conventional Branch: `<type>/<description>`, lowercase, hyphen-separated.
+
+- Purpose types: `feature/` / `feat/`, `bugfix/` / `fix/`, `hotfix/`, `release/`, `chore/`.
+- Docs or dependency change → `chore/`, not `docs/`.
+- Agent-opened branches: prefix `cursor/`, `claude/`, `codex/`, `copilot/`, or `ai/`.
