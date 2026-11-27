@@ -319,6 +319,7 @@ fn heap_sync_skip() -> bool {
 /// others are still mirrored. Returns pages read, slots looked at, slots
 /// mirrored.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn mirror_read(
     host: &host::HostHeap,
     buf: &mut Vec<u8>,
