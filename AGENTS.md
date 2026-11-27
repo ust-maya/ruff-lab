@@ -24,9 +24,7 @@ The two `cargo test` lines in the README are a subset of this, not a substitute.
 
 `cargo xtask policy` is the check, and `repository_passes_policy` in `xtask` runs it on the whole tree. Install the hook with `cargo xtask install-hooks`.
 
-A file passes only with an allowlisted extension (`rs`, `toml`, `md`, `txt`, `lock`, `yml`, `yaml`, `json`, `hlsl`, `hlsli`, `ps1`, `cmd`, `sh`) or an allowlisted name, under 512 KiB, with no NUL bytes, no known binary signatures, and no hex/base64 run longer than 512 characters. The only exception is `crates/victory-formats/src/bcpack-tables.bin`. A new extension needs an entry in `xtask/src/policy.rs`.
-
-`docs/klbf/logo.svg` is already tracked, and `svg` is not on the allowlist, so `repository_passes_policy` fails on this tree before any new edit. Leave that file alone in an unrelated change.
+A file passes only with an allowlisted extension (`rs`, `toml`, `md`, `mdc`, `txt`, `lock`, `yml`, `yaml`, `json`, `hlsl`, `hlsli`, `ps1`, `cmd`, `sh`, `svg`) or an allowlisted name, under 512 KiB, with no NUL bytes, no known binary signatures, and no hex/base64 run longer than 512 characters. The only exception is `crates/victory-formats/src/bcpack-tables.bin`. A new extension needs an entry in `xtask/src/policy.rs`.
 
 Do not commit game files, dumps, shader dumps, screenshots, or `victory.toml`. Paths to those live outside the repository. `.victory-root` plus `victory_core::ensure_outside_repo` refuse derived data written inside the tree. A leak is removed with `git filter-repo`, not with a follow-up commit.
 
