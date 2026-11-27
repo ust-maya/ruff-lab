@@ -1648,8 +1648,8 @@ fn short_side() -> u64 {
 }
 
 /// How many largest mips to omit for a title-filled 2D single-slice texture:
-/// respects `VICTORY_TEXTURE_DROP_MIPS` (0..=4 on >=512 px textures, or
-/// >=256/128 px in `VICTORY_LOW_GRAPHICS=1/2` while preserving UI),
+/// respects `VICTORY_TEXTURE_DROP_MIPS` (0..=4 on 512+ px textures, or
+/// 256/128+ px in `VICTORY_LOW_GRAPHICS=1/2` while preserving UI),
 /// `VICTORY_TEXTURE_MAX_DIM` (on placed BC textures, preserving UI via `keep_ui`),
 /// and `ShortOfRoom` (`short_side()`, default 256 px).
 #[cfg(windows)]
@@ -3132,7 +3132,7 @@ static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }

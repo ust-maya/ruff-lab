@@ -1167,7 +1167,8 @@ impl State {
                 42 => 4u64, // DXGI_FORMAT_R32_UINT
                 _ => 0u64,
             };
-            if align == 0 || v.address == 0 || u64::from(v.size) < align || v.address % align != 0 {
+            if align == 0 || v.address == 0 || u64::from(v.size) < align || !v.address.is_multiple_of(align)
+            {
                 return false;
             }
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
@@ -2359,14 +2360,12 @@ impl State {
             }
             None => (span, per_frame),
         };
-        let mut processed = 0usize;
-        for (index, write) in due {
+        for (processed, (index, write)) in due.into_iter().enumerate() {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most
                 || (processed > 0 && pass_began.elapsed() > span)
             {
                 break;
             }
-            processed += 1;
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -3023,7 +3022,7 @@ impl State {
             let draws: u32 = census.1.values().sum();
             if draws > 0 {
                 let mut rects: Vec<([i32; 4], u32)> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
-                rects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                rects.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
                 let scissors: Vec<String> = rects
                     .iter()
                     .take(5)

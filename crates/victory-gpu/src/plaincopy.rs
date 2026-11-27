@@ -23,6 +23,7 @@ static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// One count per requested host read. The kernel may split a failed read
 /// into several smaller ones to fill holes. Those retries belong to the
 /// same request on the frame line.
+#[allow(dead_code)] // frame-line helper; counters still update via COUNTS
 pub(crate) fn per_frame(frames: f64) -> [f64; 5] {
     COUNTS
         .each_ref()
