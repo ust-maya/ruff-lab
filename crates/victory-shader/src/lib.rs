@@ -24,6 +24,11 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
 
+/// Hash of the translator sources that feed host shader code (and thus
+/// pipeline library names). Changes when `victory-shader` is rebuilt.
+/// Ported from Marvisak/VIctory#2706.
+pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]
