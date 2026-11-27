@@ -3641,6 +3641,7 @@ fn hand_back(back: &[Declared]) {
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            crate::wc::back(*from, written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
         }
@@ -3673,6 +3674,7 @@ fn hand_back(back: &[Declared]) {
         for (from, to) in spans {
             let written = shadow.copy_back(from, to - from);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            crate::wc::back(from, written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
         }

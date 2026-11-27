@@ -3258,7 +3258,9 @@ impl Shadow {
             Vec::new()
         };
         if self.pending_len.load(Ordering::Acquire) == 0 && owned.is_empty() {
-            return self.update_free(from, to);
+            let bytes = self.update_free(from, to);
+            crate::wc::up(from, bytes as u64);
+            return bytes;
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending
@@ -3284,9 +3286,12 @@ impl Shadow {
             if at < to {
                 bytes += self.update_free(at, to);
             }
+            crate::wc::up(from, bytes as u64);
             return bytes;
         }
-        self.update_free(from, to)
+        let bytes = self.update_free(from, to);
+        crate::wc::up(from, bytes as u64);
+        bytes
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
