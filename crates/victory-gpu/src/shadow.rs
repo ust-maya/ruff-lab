@@ -44,6 +44,11 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// With `VICTORY_WC_NO_BACK=1`: ranges shaders wrote that were not copied
+    /// back ([`crate::wc::skip_back`]): title memory there is older than the
+    /// copy for good, so a refresh that cannot tell what the CPU wrote
+    /// (not watched) leaves them out.
+    card_owned: Mutex<crate::wc::Ranges>,
     /// Lock-free count of `pending`, updated strictly inside `pending`'s lock
     /// so `update` and `writes_pending` skip locking when empty (PR #2848).
     pending_len: std::sync::atomic::AtomicUsize,
@@ -425,13 +430,24 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// and no other piece is. Ranges sent up lie close together (514 a frame
 /// for 87 MB in run 102), and each had a pass of its own over its pieces,
 /// so a piece that held several ranges was hashed once for each.
-pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
+#[cfg(test)]
+pub(crate) fn joined_piece_runs(runs: Vec<CardSpan>) -> Vec<CardSpan> {
+    joined_piece_runs_within(runs, 0)
+}
+
+/// Joins piece runs that touch or are separated by at most `max_gap` 64 KiB
+/// pieces (`VICTORY_CARD_REHASH_GAP`). Bridging a few unchanged pieces inside
+/// one dispatch cuts small `Dispatch` launches per frame.
+pub(crate) fn joined_piece_runs_within(mut runs: Vec<CardSpan>, max_gap: u32) -> Vec<CardSpan> {
     runs.sort_unstable_by_key(|r| r.first);
     let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
-                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+            Some(last)
+                if run.first <= last.first.saturating_add(last.pieces).saturating_add(max_gap) =>
+            {
+                let end = (last.first + last.pieces).max(run.first + run.pieces);
+                last.pieces = end - last.first;
                 last.to = last.to.max(run.to);
             }
             _ => out.push(run),
@@ -476,7 +492,10 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{
+        CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs,
+        joined_piece_runs_within,
+    };
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -498,6 +517,13 @@ mod card_tests {
         assert_eq!(joined.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(), [(3, 5), (9, 1), (40, 3), (100, 1)]);
         assert!(joined.iter().all(|r| r.skew == 7));
         assert!(joined_piece_runs(Vec::new()).is_empty());
+        // Gap of 3 joins 9 into the 3..8 run (first 3, pieces 5 → end 8; 9 is 1 away).
+        let gapped = vec![run(3, 5), run(9, 1), run(40, 1)];
+        let bridged = joined_piece_runs_within(gapped, 3);
+        assert_eq!(
+            bridged.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(),
+            [(3, 7), (40, 1)]
+        );
     }
 
     /// The offsets the compare's shader takes for a piece (`CARD_COMPARE`
@@ -1149,7 +1175,79 @@ mod relay_tests {
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool {
+    buffers: Vec::new(),
+    bytes: 0,
+});
+
+/// Descending-capacity pool with O(log n) best-fit take (Vice-Tay #58).
+#[derive(Default)]
+struct SnapshotPool {
+    /// Descending capacity order, preserved on insertion and removal.
+    buffers: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+impl SnapshotPool {
+    fn take(&mut self, n: usize) -> Option<Vec<u8>> {
+        let most = n.saturating_mul(4).max(1 << 20);
+        let i = self.buffers.partition_point(|v| v.capacity() >= n).checked_sub(1)?;
+        if self.buffers[i].capacity() > most {
+            return None;
+        }
+        let v = self.buffers.remove(i);
+        self.bytes -= v.capacity();
+        Some(v)
+    }
+
+    fn put(&mut self, v: Vec<u8>) {
+        let capacity = v.capacity();
+        let i = self.buffers.partition_point(|b| b.capacity() >= capacity);
+        self.buffers.insert(i, v);
+        self.bytes += capacity;
+    }
+
+    /// Normal returns keep the largest buffers, including one oversized buffer.
+    fn keep_largest(&mut self, count: usize, most: usize) -> Vec<Vec<u8>> {
+        if self.buffers.len() <= count && self.bytes <= most {
+            return Vec::new();
+        }
+        let (mut keep, mut bytes) = (0, 0);
+        for v in self.buffers.iter().take(count) {
+            let next = bytes + v.capacity();
+            if keep > 0 && next > most {
+                break;
+            }
+            keep += 1;
+            bytes = next;
+        }
+        self.bytes = bytes;
+        self.buffers.split_off(keep)
+    }
+
+    /// Pressure sweeps keep the smallest buffers. An idle sweep takes the whole pool.
+    fn keep_smallest(&mut self, most: usize) -> Vec<Vec<u8>> {
+        if most == 0 {
+            self.bytes = 0;
+            return std::mem::take(&mut self.buffers);
+        }
+        if self.bytes <= most {
+            return Vec::new();
+        }
+        let (mut keep, mut bytes) = (0, 0);
+        for v in self.buffers.iter().rev() {
+            let next = bytes + v.capacity();
+            if next > most {
+                break;
+            }
+            keep += 1;
+            bytes = next;
+        }
+        self.bytes = bytes;
+        let kept = self.buffers.split_off(self.buffers.len() - keep);
+        std::mem::replace(&mut self.buffers, kept)
+    }
+}
 
 /// When a snapshot buffer was last taken from or given back to [`POOL`]
 /// ([`crate::host::moment`]), for [`let_go_idle_snapshots`].
@@ -1158,21 +1256,14 @@ static POOL_USED: AtomicU64 = AtomicU64::new(0);
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
-/// reserved (1.4 GB in run 24).
+/// reserved (1.4 GB in run 24). Allocation runs after the mutex is dropped.
 fn pooled(n: usize) -> Vec<u8> {
-    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let most = n.saturating_mul(4).max(1 << 20);
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+    let reused = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
+        pool.take(n)
     };
+    let mut v = reused.unwrap_or_else(|| Vec::with_capacity(n));
     v.clear();
     v
 }
@@ -1181,24 +1272,13 @@ fn pooled(n: usize) -> Vec<u8> {
 /// of those the largest one and the next ones up to `KEPT` bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
-    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
+    const COUNT: usize = 8;
     let gone = {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        pool.push(v);
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        let mut gone = if pool.len() > 8 { pool.split_off(8) } else { Vec::new() };
-        let (mut seen, mut total) = (0, 0usize);
-        let mut i = 0;
-        while i < pool.len() {
-            seen += 1;
-            total = total.saturating_add(pool[i].capacity());
-            if seen == 1 || total <= KEPT {
-                i += 1;
-            } else {
-                gone.push(pool.remove(i));
-            }
-        }
-        gone
+        POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
+        pool.put(v);
+        // (Given back to the kernel without the lock: milliseconds.)
+        pool.keep_largest(COUNT, KEPT)
     };
     drop(gone);
 }
@@ -1231,7 +1311,7 @@ fn let_go_idle_snapshots() {
     };
     let gone = {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        trim_pool(&mut pool, most)
+        pool.keep_smallest(most)
     };
     drop(gone);
 }
@@ -1241,7 +1321,8 @@ fn let_go_idle_snapshots() {
 pub(crate) fn drain_pools() {
     let gone_snaps = {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *pool)
+        pool.bytes = 0;
+        std::mem::take(&mut pool.buffers)
     };
     let gone_exact = {
         let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1262,24 +1343,6 @@ fn snapshots_to_keep(idle: bool, pressured: bool) -> Option<usize> {
     }
 }
 
-/// Keeps the smallest buffers of `pool`, up to `most` bytes of capacity in
-/// all, and returns the others (largest first) for the caller to free.
-fn trim_pool(pool: &mut Vec<Vec<u8>>, most: usize) -> Vec<Vec<u8>> {
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0usize;
-    let mut keep = 0;
-    for v in pool.iter().rev() {
-        total = total.saturating_add(v.capacity());
-        if total > most {
-            break;
-        }
-        keep += 1;
-    }
-    let first_kept = pool.len() - keep;
-    let kept = pool.split_off(first_kept);
-    std::mem::replace(pool, kept)
-}
-
 #[cfg(test)]
 mod pool_tests {
     use super::*;
@@ -1288,33 +1351,66 @@ mod pool_tests {
         pool.iter().map(Vec::capacity).collect()
     }
 
+    fn pool_with_sizes(mib: &[usize]) -> SnapshotPool {
+        let mut pool = SnapshotPool::default();
+        for &n in mib {
+            pool.put(Vec::with_capacity(n << 20));
+        }
+        pool
+    }
+
+    #[test]
+    fn reuse_takes_the_smallest_fit_and_tracks_capacity() {
+        let mut pool = pool_with_sizes(&[8, 1, 4, 2, 4]);
+        assert!(pool.take(9 << 20).is_none());
+        assert_eq!(pool.take(3 << 20).unwrap().capacity(), 4 << 20);
+        assert_eq!(pool.take(5 << 20).unwrap().capacity(), 8 << 20);
+        assert_eq!(sizes(&pool.buffers), [4 << 20, 2 << 20, 1 << 20]);
+        assert_eq!(pool.bytes, 7 << 20);
+        assert_eq!(pool.take(1).unwrap().capacity(), 1 << 20);
+        assert!(pool.take(1).is_none());
+        assert_eq!(pool.bytes, 6 << 20);
+    }
+
+    #[test]
+    fn normal_returns_obey_size_and_count_limits() {
+        let mut pool = pool_with_sizes(&[8, 2, 4, 1]);
+        assert!(pool.keep_largest(4, 16 << 20).is_empty());
+        assert_eq!(pool.bytes, 15 << 20);
+        assert_eq!(sizes(&pool.keep_largest(2, 16 << 20)), [2 << 20, 1 << 20]);
+        assert_eq!(pool.bytes, 12 << 20);
+        assert_eq!(sizes(&pool.keep_largest(2, 7 << 20)), [4 << 20]);
+        assert_eq!(pool.bytes, 8 << 20);
+        assert_eq!(sizes(&pool.keep_largest(0, 7 << 20)), [8 << 20]);
+        assert!(pool.buffers.is_empty());
+        assert_eq!(pool.bytes, 0);
+    }
+
     #[test]
     fn trimming_keeps_the_smallest_up_to_the_limit() {
-        let mut pool: Vec<Vec<u8>> = [8usize, 1, 4, 2]
-            .iter()
-            .map(|&n| Vec::with_capacity(n << 20))
-            .collect();
-        let gone = trim_pool(&mut pool, 7 << 20);
-        assert_eq!(sizes(&pool), [4 << 20, 2 << 20, 1 << 20]);
+        let mut pool = pool_with_sizes(&[8, 1, 4, 2]);
+        let gone = pool.keep_smallest(7 << 20);
+        assert_eq!(sizes(&pool.buffers), [4 << 20, 2 << 20, 1 << 20]);
         assert_eq!(sizes(&gone), [8 << 20]);
+        assert_eq!(pool.bytes, 7 << 20);
+        assert!(pool.keep_smallest(7 << 20).is_empty());
     }
 
     #[test]
     fn trimming_to_nothing_empties_the_pool() {
-        let mut pool: Vec<Vec<u8>> = [3usize, 1]
-            .iter()
-            .map(|&n| Vec::with_capacity(n << 20))
-            .collect();
-        let gone = trim_pool(&mut pool, 0);
-        assert!(pool.is_empty());
+        let mut pool = pool_with_sizes(&[3, 1]);
+        let gone = pool.keep_smallest(0);
+        assert!(pool.buffers.is_empty());
+        assert_eq!(pool.bytes, 0);
         assert_eq!(sizes(&gone), [3 << 20, 1 << 20]);
     }
 
     #[test]
     fn a_buffer_past_the_limit_goes_even_alone() {
-        let mut pool = vec![Vec::<u8>::with_capacity(600 << 20)];
-        let gone = trim_pool(&mut pool, POOL_PRESSURED_KEPT);
-        assert!(pool.is_empty());
+        let mut pool = pool_with_sizes(&[600]);
+        let gone = pool.keep_smallest(POOL_PRESSURED_KEPT);
+        assert!(pool.buffers.is_empty());
+        assert_eq!(pool.bytes, 0);
         assert_eq!(gone.len(), 1);
     }
 
@@ -2469,7 +2565,7 @@ pub(crate) fn memory() -> [u64; 6] {
     };
     let (kept, kept_bytes) = {
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum::<u64>())
+        (pool.buffers.len() as u64, pool.bytes as u64)
     };
     [
         LIVE[0].load(Ordering::Relaxed),
@@ -2562,6 +2658,7 @@ impl Shadow {
             ranged: Mutex::new([(0, 0, 0); 2]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            card_owned: Mutex::default(),
             pending_len: std::sync::atomic::AtomicUsize::new(0),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3240,8 +3337,21 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        if self.pending_len.load(Ordering::Acquire) == 0 {
-            return self.update_free(from, to);
+        // Ranges the card keeps (`VICTORY_WC_NO_BACK`): left out where the
+        // write watch cannot say which pages the CPU wrote.
+        let owned = if crate::wc::no_back() && self.unwatched() {
+            self.card_owned
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .overlapping(from, to)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if self.pending_len.load(Ordering::Acquire) == 0 && owned.is_empty() {
+            let bytes = self.update_free(from, to);
+            crate::wc::up(from, bytes as u64);
+            return bytes;
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending
@@ -3251,6 +3361,7 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        busy.extend(owned);
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -3266,9 +3377,12 @@ impl Shadow {
             if at < to {
                 bytes += self.update_free(at, to);
             }
+            crate::wc::up(from, bytes as u64);
             return bytes;
         }
-        self.update_free(from, to)
+        let bytes = self.update_free(from, to);
+        crate::wc::up(from, bytes as u64);
+        bytes
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -3490,6 +3604,25 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Whether the memory behind the copy is write-watched as of its last
+    /// refresh (not before the first).
+    pub(crate) fn watched_known(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == 1
+    }
+
+    /// Shaders write `[address, address + len)` and it is not copied back
+    /// (`VICTORY_WC_NO_BACK`, [`crate::wc::skip_back`]): the copy holds the
+    /// newest bytes there from now on.
+    pub(crate) fn card_owns(&self, address: usize, len: usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return;
+        }
+        self.card_owned.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+        crate::wc::census_note((to - from) as u64);
     }
 
     /// Whether this buffer is placed directly over title memory (`crate::inplace`).

@@ -91,6 +91,7 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    let asked = protect;
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -161,6 +162,10 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    // Console protection (write-combined / uncached bits) for WC_NO_BACK.
+    if !at.is_null() {
+        victory_gpu::title_memory_protection(at as usize, size, asked);
     }
     at
 }

@@ -253,6 +253,34 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (128, 256 << 20);
 
+/// The most host lists kept idle (`VICTORY_IDLE_LISTS`, at most
+/// [`IDLE_MOST`]'s count, which is also the default when unset). Caps only
+/// when the env is set (Belobug #620 / RDNA 2 allocator ceiling).
+#[cfg(windows)]
+fn idle_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_IDLE_LISTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(IDLE_MOST.0)
+            .min(IDLE_MOST.0)
+    })
+}
+
+/// The most host lists alive before lists that have run are let go instead
+/// of kept (`VICTORY_LIST_CEILING`; unset: no ceiling, as before). Belobug
+/// #620: on RDNA 2, ~1300 held with the relay on.
+#[cfg(windows)]
+fn list_ceiling() -> Option<u64> {
+    static MOST: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_LIST_CEILING")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -317,7 +345,15 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most()
+        {
+            continue;
+        }
+        if list_ceiling().is_some_and(|most| {
+            crate::host::ALIVE[0].load(std::sync::atomic::Ordering::Relaxed) > most
+        }) {
+            let spare = std::mem::take(&mut *IDLE.lock().unwrap_or_else(|e| e.into_inner()));
+            drop(spare);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -325,7 +361,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < idle_most() && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
@@ -364,6 +400,18 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     }
+    if let Some(clamps) = list
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .finish_list(current)
+    {
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part {
+            waits,
+            host: clamps,
+        });
+    }
     let Some(fresh) = fresh_list() else {
         // shortcut: without a new host list the wait stands before the part
         // it was recorded in.
@@ -387,6 +435,80 @@ fn cut(this: This, wait: ValueWait) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .replay(host);
+    }
+}
+
+/// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
+/// of the list's draws already go to a list before it and nothing since may
+/// have written arguments, the recording is cut here; a list for the clamps
+/// of the draws to come follows what was recorded, and the recording goes
+/// on in another list after it, with the state the title set.
+#[cfg(windows)]
+fn hoist(this: This) {
+    if this.is_null() || !crate::indirect::hoisting() {
+        return;
+    }
+    // SAFETY: one of our lists; the title uses it on one thread at a time,
+    // and no reference to the host list is in use here.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(current) = list.host.as_ref() else {
+        return;
+    };
+    if state.hoists_into(current) {
+        return;
+    }
+    if let Some(clamps) = state.finish_list(current) {
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part {
+            waits,
+            host: clamps,
+        });
+    }
+    let Some(next) = fresh_list() else {
+        return;
+    };
+    // What was recorded keeps its place; with no work in it, it holds the
+    // clamps itself (the state set in it does them no harm).
+    let clamps = if !current.untouched() || crate::indirect::hoist_mode() == 5 {
+        let Some(clamps) = fresh_list() else {
+            return;
+        };
+        if let Some(old) = list.host.replace(next) {
+            old.close();
+            let waits = std::mem::take(&mut list.gate);
+            list.earlier.push(Part { waits, host: old });
+        }
+        clamps
+    } else {
+        let Some(old) = list.host.replace(next) else {
+            return;
+        };
+        old
+    };
+    if let Some(next) = list.host.as_ref() {
+        state.replay(next);
+        state.hoist(clamps, next);
+    }
+}
+
+/// Ends an open hoist before the host list is taken for submission.
+#[cfg(windows)]
+fn finish_open_hoist(list: &mut List) {
+    let Some(current) = list.host.as_ref() else {
+        return;
+    };
+    if let Some(clamps) = list
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .finish_list(current)
+    {
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part {
+            waits,
+            host: clamps,
+        });
     }
 }
 
@@ -450,6 +572,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        finish_open_hoist(list);
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
@@ -519,17 +642,32 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         // A new host list is open; the title's next call on its list is a
         // reset, which wants it closed.
         fresh.close();
-        let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
-        let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        finish_open_hoist(list);
+        // When hoist left parts in `earlier`, submit them first so clamped
+        // arguments run before the draws that read them. Keyed as null so a
+        // second naming of `this` still finds the draw list Detached.
+        let earlier = std::mem::take(&mut list.earlier);
+        for part in earlier {
+            order.push(taken.len());
+            taken.push((
+                std::ptr::null_mut(),
+                Detached {
+                    host: part.host,
+                    _uploads: Vec::new(),
+                    _state: Default::default(),
+                },
+            ));
+        }
+        let (host, uploads, state) = {
+            let Some(host) = list.host.replace(fresh) else {
                 continue;
             };
             let uploads =
-                std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let state =
-                std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
+                std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
+            let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
             (host, uploads, state)
         };
         order.push(taken.len());
@@ -873,6 +1011,7 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        list.count_write();
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -2066,6 +2205,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        if kind != DISPATCH {
+            hoist(this);
+        }
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
