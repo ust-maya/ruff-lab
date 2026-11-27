@@ -213,26 +213,27 @@ fn open() -> Option<(windows_sys::Win32::Foundation::HANDLE, Kind)> {
             }
             let mut attributes: HIDD_ATTRIBUTES = std::mem::zeroed();
             attributes.Size = size_of::<HIDD_ATTRIBUTES>() as u32;
-            if HidD_GetAttributes(handle, &mut attributes) && attributes.VendorID == VENDOR {
-                if let Some(kind) = kind_of(attributes.ProductID) {
-                    let mut feature = [0u8; 64];
-                    feature[0] = match kind {
-                        Kind::DualShock4 => 0x02,
-                        Kind::DualSense => 0x05,
-                    };
-                    let _ = HidD_GetFeature(
-                        handle,
-                        feature.as_mut_ptr().cast(),
-                        feature.len() as u32,
-                    );
-                    tracing::info!(
-                        ?kind,
-                        product = format_args!("{:#06x}", attributes.ProductID),
-                        "Sony HID gamepad found: bound as slot 0 while no XInput pad is connected"
-                    );
-                    found = Some((handle, kind));
-                    break;
-                }
+            if HidD_GetAttributes(handle, &mut attributes)
+                && attributes.VendorID == VENDOR
+                && let Some(kind) = kind_of(attributes.ProductID)
+            {
+                let mut feature = [0u8; 64];
+                feature[0] = match kind {
+                    Kind::DualShock4 => 0x02,
+                    Kind::DualSense => 0x05,
+                };
+                let _ = HidD_GetFeature(
+                    handle,
+                    feature.as_mut_ptr().cast(),
+                    feature.len() as u32,
+                );
+                tracing::info!(
+                    ?kind,
+                    product = format_args!("{:#06x}", attributes.ProductID),
+                    "Sony HID gamepad found: bound as slot 0 while no XInput pad is connected"
+                );
+                found = Some((handle, kind));
+                break;
             }
             CloseHandle(handle);
         }
