@@ -10,11 +10,6 @@
 //! - `VICTORY_PORT_DESCRIPTORS` (AvatarManz #384 / #359)
 //! - `VICTORY_PORT_GUARD`, `VICTORY_PORT_JOURNAL`
 
-/// Renderer port 1: constants heap in place (`VICTORY_PORT_CONSTANTS=1`).
-pub(crate) fn constants() -> bool {
-    crate::inplace::constants_on()
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -24,7 +19,7 @@ mod tests {
         if std::env::var_os("VICTORY_PORT_CONSTANTS").is_none()
             && std::env::var_os("VICTORY_INPLACE_CONSTANTS").is_none()
         {
-            assert!(!super::constants());
+            assert!(!crate::inplace::constants_on());
         }
     }
 }
