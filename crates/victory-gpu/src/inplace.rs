@@ -213,26 +213,38 @@ fn say() {
     );
 }
 
-/// Opt-in constants heap in place (`VICTORY_INPLACE_CONSTANTS=1`, off by
-/// default; adapted from `fxceless/victory-fork` `bcc5421`). Opens the title's
+/// Opt-in constants heap in place (`VICTORY_INPLACE_CONSTANTS=1` or
+/// AvatarManz/Belobug alias `VICTORY_PORT_CONSTANTS=1`, both off by default;
+/// adapted from `fxceless/victory-fork` `bcc5421`). Opens the title's
 /// at-least-64 MiB section-backed graphics constants heap via
 /// `OpenExistingHeapFromAddress1` on our own view of the same section pages.
 /// Off by default on PCIe x8 GPUs because GPU skinning reads would cross PCIe
 /// instead of GDDR6.
 pub(crate) fn constants_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match mode_of(std::env::var("VICTORY_INPLACE_CONSTANTS").ok().as_deref()) {
-        1 => {
-            tracing::info!("the constants heap is read and written by the card in place (VICTORY_INPLACE_CONSTANTS=1)");
-            true
+    *ON.get_or_init(|| {
+        let inplace = mode_of(std::env::var("VICTORY_INPLACE_CONSTANTS").ok().as_deref());
+        let port = std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1");
+        match (inplace, port) {
+            (1, _) | (_, true) => {
+                let via = if inplace == 1 {
+                    "VICTORY_INPLACE_CONSTANTS=1"
+                } else {
+                    "VICTORY_PORT_CONSTANTS=1"
+                };
+                tracing::info!(
+                    "the constants heap is read and written by the card in place ({via}; renderer port 1)"
+                );
+                true
+            }
+            (2, _) => {
+                tracing::warn!(
+                    "VICTORY_INPLACE_CONSTANTS=alt turned down: a title buffer cannot change form while the title runs"
+                );
+                false
+            }
+            _ => false,
         }
-        2 => {
-            tracing::warn!(
-                "VICTORY_INPLACE_CONSTANTS=alt turned down: a title buffer cannot change form while the title runs"
-            );
-            false
-        }
-        _ => false,
     })
 }
 
