@@ -44,6 +44,11 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// With `VICTORY_WC_NO_BACK=1`: ranges shaders wrote that were not copied
+    /// back ([`crate::wc::skip_back`]): title memory there is older than the
+    /// copy for good, so a refresh that cannot tell what the CPU wrote
+    /// (not watched) leaves them out.
+    card_owned: Mutex<crate::wc::Ranges>,
     /// Lock-free count of `pending`, updated strictly inside `pending`'s lock
     /// so `update` and `writes_pending` skip locking when empty (PR #2848).
     pending_len: std::sync::atomic::AtomicUsize,
@@ -2632,6 +2637,7 @@ impl Shadow {
             ranged: Mutex::new([(0, 0, 0); 2]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            card_owned: Mutex::default(),
             pending_len: std::sync::atomic::AtomicUsize::new(0),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3310,8 +3316,21 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        if self.pending_len.load(Ordering::Acquire) == 0 {
-            return self.update_free(from, to);
+        // Ranges the card keeps (`VICTORY_WC_NO_BACK`): left out where the
+        // write watch cannot say which pages the CPU wrote.
+        let owned = if crate::wc::no_back() && self.unwatched() {
+            self.card_owned
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .overlapping(from, to)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if self.pending_len.load(Ordering::Acquire) == 0 && owned.is_empty() {
+            let bytes = self.update_free(from, to);
+            crate::wc::up(from, bytes as u64);
+            return bytes;
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending
@@ -3321,6 +3340,7 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        busy.extend(owned);
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -3336,9 +3356,12 @@ impl Shadow {
             if at < to {
                 bytes += self.update_free(at, to);
             }
+            crate::wc::up(from, bytes as u64);
             return bytes;
         }
-        self.update_free(from, to)
+        let bytes = self.update_free(from, to);
+        crate::wc::up(from, bytes as u64);
+        bytes
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -3560,6 +3583,25 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Whether the memory behind the copy is write-watched as of its last
+    /// refresh (not before the first).
+    pub(crate) fn watched_known(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == 1
+    }
+
+    /// Shaders write `[address, address + len)` and it is not copied back
+    /// (`VICTORY_WC_NO_BACK`, [`crate::wc::skip_back`]): the copy holds the
+    /// newest bytes there from now on.
+    pub(crate) fn card_owns(&self, address: usize, len: usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return;
+        }
+        self.card_owned.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+        crate::wc::census_note((to - from) as u64);
     }
 
     /// Whether this buffer is placed directly over title memory (`crate::inplace`).
