@@ -164,10 +164,46 @@ fn apply_preset(set: &[String], frames: u32, out: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Resolves the bench JSON output path.
+///
+/// Without an explicit `--out` this is `cfg.cache_subdir("bench")/bench-<ts>.json`
+/// (created by `cache_subdir`). An explicit path must pass the asset policy
+/// first — anything inside the repository is refused with a clear error.
+#[allow(dead_code)]
+fn resolve_out(cfg: &victory_core::Config, out: Option<PathBuf>, ts: String) -> Result<PathBuf> {
+    if let Some(out) = out {
+        victory_core::ensure_outside_repo(&out)?;
+        Ok(out)
+    } else {
+        Ok(cfg.cache_subdir("bench")?.join(format!("bench-{ts}.json")))
+    }
+}
+
+/// Asserts the RED pipeline cache is warm: the keyed
+/// `pipelines/<SOURCE_HASH>/` directory under every `Config` cache must exist.
+/// The check does not create the directory — a missing cache means the user
+/// still has to run the prebuild first.
+#[allow(dead_code)]
+fn ensure_pipelines(cfg: &victory_core::Config) -> Result<()> {
+    let dir = cfg
+        .cache_dir
+        .join("pipelines")
+        .join(victory_shader::SOURCE_HASH);
+    victory_core::ensure_outside_repo(&dir)?;
+    if !dir.exists() {
+        anyhow::bail!("run translate --cache --pipelines first");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{apply_preset, parse_set_arg, wave9_key_events, wave9_victory_keys};
-    use std::path::PathBuf;
+    use super::{
+        apply_preset, ensure_pipelines, parse_set_arg, resolve_out, wave9_key_events,
+        wave9_victory_keys,
+    };
+    use std::path::{Path, PathBuf};
+    use victory_core::Config;
 
     #[test]
     fn parse_set_arg_parses_key_and_value() {
@@ -213,6 +249,71 @@ mod tests {
         assert_eq!(events[5], (35.0, "Down"));
         assert_eq!(events[6].1, "Enter");
         assert!((events[6].0 - 35.4).abs() < 1e-9);
+    }
+
+    fn cache_dir_in_temp() -> (Config, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "victory-bench-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = Config {
+            cache_dir: base.clone(),
+            ..Default::default()
+        };
+        (cfg, base)
+    }
+
+    #[test]
+    fn resolve_out_default_uses_cache_bench_subdir() {
+        let (cfg, base) = cache_dir_in_temp();
+        let out = resolve_out(&cfg, None, "20261128-120000".to_owned()).unwrap();
+        let expected = cfg
+            .cache_subdir("bench")
+            .unwrap()
+            .join("bench-20261128-120000.json");
+        assert_eq!(out, expected);
+        assert!(expected.parent().unwrap().is_dir());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_out_explicit_inside_repo_is_refused() {
+        let (cfg, base) = cache_dir_in_temp();
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("bench-out.json");
+        let err = resolve_out(&cfg, Some(inside), "x".to_owned()).unwrap_err();
+        assert!(
+            err.to_string().contains("inside") || err.to_string().contains("refusing"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_out_explicit_outside_repo_is_kept() {
+        let (cfg, base) = cache_dir_in_temp();
+        let out_path = base.join("custom").join("result.json");
+        assert_eq!(
+            resolve_out(&cfg, Some(out_path.clone()), "x".to_owned()).unwrap(),
+            out_path
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ensure_pipelines_requires_warm_cache() {
+        let (cfg, base) = cache_dir_in_temp();
+        let err = ensure_pipelines(&cfg).unwrap_err();
+        assert_eq!(err.to_string(), "run translate --cache --pipelines first");
+        std::fs::create_dir_all(base.join("pipelines").join(victory_shader::SOURCE_HASH)).unwrap();
+        ensure_pipelines(&cfg).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
