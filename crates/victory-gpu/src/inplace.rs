@@ -215,9 +215,10 @@ fn say() {
 
 /// Opt-in constants heap in place (`VICTORY_INPLACE_CONSTANTS=1`, off by
 /// default; adapted from `fxceless/victory-fork` `bcc5421`). Opens the title's
-/// >=64 MiB section-backed graphics constants heap via `OpenExistingHeapFromAddress1`
-/// on our own view of the same section pages. Off by default on PCIe x8 GPUs
-/// because GPU skinning reads would cross PCIe instead of GDDR6.
+/// at-least-64 MiB section-backed graphics constants heap via
+/// `OpenExistingHeapFromAddress1` on our own view of the same section pages.
+/// Off by default on PCIe x8 GPUs because GPU skinning reads would cross PCIe
+/// instead of GDDR6.
 pub(crate) fn constants_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match mode_of(std::env::var("VICTORY_INPLACE_CONSTANTS").ok().as_deref()) {

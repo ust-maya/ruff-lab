@@ -164,6 +164,7 @@ pub(crate) fn waiting() -> u64 {
 }
 
 /// Graphics pipelines queued or compiling right now.
+#[allow(dead_code)] // kept for the frame line / future callers
 pub(crate) fn waiting_gfx() -> u64 {
     WAITING_GFX.load(Ordering::Relaxed)
 }

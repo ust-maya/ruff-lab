@@ -604,8 +604,8 @@ mod tests {
         let night = super::sky_amount(0.0005, super::DEFAULT_SKY, super::DEFAULT);
         let dusk_cell = super::sky_amount(0.02, super::DEFAULT_SKY, super::DEFAULT);
         let noon = super::sky_amount(3.0, super::DEFAULT_SKY, super::DEFAULT);
-        assert!(night >= 0.08 && night <= 0.13, "night={night}");
-        assert!(dusk_cell >= 0.16 && dusk_cell <= 0.24, "dusk_cell={dusk_cell}");
+        assert!((0.08..=0.13).contains(&night), "night={night}");
+        assert!((0.16..=0.24).contains(&dusk_cell), "dusk_cell={dusk_cell}");
         assert!((noon - super::DEFAULT).abs() < 1e-6, "noon={noon}");
     }
 }
