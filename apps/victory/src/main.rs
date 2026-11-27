@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod bench;
 mod census;
 mod inspect;
 #[cfg(windows)]
@@ -119,6 +120,16 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Benchmark a title executable.
+    Bench {
+        exe: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        frames: u32,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long = "set")]
+        set: Vec<String>,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -197,6 +208,12 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::Bench {
+            exe,
+            frames,
+            out,
+            set,
+        } => bench::run(&exe, frames, out, set),
         Command::Config => show_config(),
     }
 }
