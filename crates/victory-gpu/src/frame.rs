@@ -238,7 +238,11 @@ mod tests {
                 LAST[2].load(Ordering::Relaxed)
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        // Each flip takes a tick of its own. On a loaded runner a 5 ms tick
+        // can pass more than once between waits; the late-wait path then
+        // ends on a later tick, so the numbers rise without staying adjacent
+        // (CI saw [3, 5, 6, 8]).
+        assert!(flips.windows(2).all(|w| w[1] > w[0]), "{flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
