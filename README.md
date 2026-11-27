@@ -174,6 +174,27 @@ cargo build --release -p victory
 - No fps/frame-time numbers are recorded here: a number belongs in
   `logs/results.md` only when captured on the target GPU (see AGENTS.md).
 
+### When to use (and when not)
+
+**Use `bench` when:**
+- comparing two flags / two commits on the same scene (prison) — one
+  command per variant, JSON reports are directly comparable;
+- recording a number for `logs/results.md` — the wall-clock + heavy-sample
+  definition is fixed, so rows stop drifting between runs;
+- catching an integrated regression (list caps, copy paths, pipeline
+  waits) that no single subsystem microbench would see.
+
+**Do not use `bench` when:**
+- you need menu / boot timing — menus are 14 draws, bench counts only
+  `draws>=2500` heavy samples and ignores them;
+- the pipeline cache is cold — bench fails fast
+  (`run translate --cache --pipelines first`) by design;
+- you are debugging a crash, a wrong picture, or a hang — use
+  `run --execute` directly (with the diagnostics feature);
+- you expect it to shrink the ~8 min to the prison scene — it removes
+  babysitting, not game load time. For seconds-level iteration on one
+  hotspot, use the subsystem microbenchmarks below instead.
+
 Subsystem microbenchmarks (ignored tests, release build):
 
 ```powershell
