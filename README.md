@@ -16,11 +16,19 @@
 
 ---
 
-## Status (2026-11-26)
+## Status (2026-11-27)
 
 **Stage 6 — In-game (player-controlled gameplay verified)** on an 8 GB VRAM / 16 GB RAM PC.
 
-Tested on: **Windows 11 x64 (`26200`)** · **AMD Radeon RX 6600 XT 8 GB** (RDNA2, Adrenalin **26.11.2** / `32.0.21045.29003`) · **AMD Ryzen 5 3600** (6C/12T) · **16 GB RAM** (pagefile on **M.2 NVMe SSD**) · **500 GB 5400 RPM SATA HDD** (game files on `D:`).
+Tested on: **Windows 10 x64 (`10.0.26300`)** · **AMD Radeon RX 6600 XT 8 GB** (RDNA2, Adrenalin **26.11.2** / `32.0.21045.29003`) · **AMD Ryzen 5 3600** (6C/12T) · **16 GB RAM** (pagefile on **M.2 NVMe SSD**) · game files on `G:\GTA6\...` (PowerShell).
+
+**Paths on this PC**
+
+| Role | Path |
+|---|---|
+| Git repo / build | `G:\GTA6\ruff-lab` |
+| Game dump (`victory.toml` → `game_dir`) | `G:\GTA6\GTA6.Xbox.v1.0.2.1` |
+| Standalone exe copy (no git) | `G:\GTA6\MAIN EXECUTABLE\game_scarlett_master.exe` |
 
 | Lane / Stage | Status | Details |
 |---|---|---|
@@ -66,10 +74,11 @@ Most compatibility forks are tested on 32 GB RAM and 12–16 GB VRAM cards. `ruf
 
 ## Building & Running
 
-Requires Windows 10/11 x64, AVX2 CPU, D3D12 SM 6.6 + Mesh Shaders GPU, Rust (`1.98.1`, pinned in `rust-toolchain.toml`), MSVC C++ Build Tools, and [AMD FidelityFX SDK v2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases) for Series S + FSR mode.
+Requires Windows 10/11 x64, AVX2 CPU, D3D12 SM 6.6 + Mesh Shaders GPU, Rust (`1.98.1`, pinned in `rust-toolchain.toml`), MSVC C++ Build Tools, and [AMD FidelityFX SDK v2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases) for Series S + FSR mode. Shell below is **PowerShell** from `G:\GTA6\ruff-lab`.
 
 ```powershell
-copy victory.example.toml victory.toml   # set game_dir outside the repo
+cd G:\GTA6\ruff-lab
+copy victory.example.toml victory.toml   # then set game_dir = 'G:\GTA6\GTA6.Xbox.v1.0.2.1'
 cargo test -p victory-gpu --lib -- --test-threads=1
 cargo test -p victory-hle --lib dstorage
 cargo build --release -p victory
@@ -80,12 +89,13 @@ Pre-build pipelines once (recommended on AMD):
 ```powershell
 $env:VICTORY_SHADER_OPT = '0'
 $env:VICTORY_SKIP_PIPELINES = (Get-Content docs\klbf\skip-amd.txt -Raw).Trim()
-.\target\release\victory.exe translate --cache --pipelines --jobs 8 "<game_dir>\shaders.rpf"
+.\target\release\victory.exe translate --cache --pipelines --jobs 8 'G:\GTA6\GTA6.Xbox.v1.0.2.1\shaders.rpf'
 ```
 
-Run (`--console series-s` + AMD FSR, tuned for 8 GB VRAM / 16 GB RAM + M.2 pagefile / 6C12T CPU / HDD; add `$env:VICTORY_FRAMEGEN = '1'` for AMD FSR Frame Generation):
+Run (`--console series-s` + AMD FSR, tuned for 8 GB VRAM / 16 GB RAM + M.2 pagefile / 6C12T CPU; add `$env:VICTORY_FRAMEGEN = '1'` for AMD FSR Frame Generation; optional `$env:VICTORY_LOW_GRAPHICS = '1'` or `'2'` for low / potato mode):
 
 ```powershell
+$game = 'G:\GTA6\GTA6.Xbox.v1.0.2.1'
 $env:VICTORY_SHADER_OPT = '0'
 $env:VICTORY_SKIP_PIPELINES = (Get-Content docs\klbf\skip-amd.txt -Raw).Trim()
 $env:VICTORY_LATE_WAIT = '3'
@@ -118,7 +128,7 @@ $env:VICTORY_DYNAMIC_SLOTS = '524288'
 $env:VICTORY_DISPLAY_MODE = '1280x720'
 $env:VICTORY_AMBIENT_SHADE = '0'
 $env:VICTORY_FFX_DIR = '<FidelityFX SDK>\Kits\FidelityFX\signedbin'
-.\target\release\victory.exe run --console series-s "<game_dir>\game_scarlett_master.exe" --execute
+.\target\release\victory.exe run --console series-s "$game\game_scarlett_master.exe" --execute
 ```
 
 ---
