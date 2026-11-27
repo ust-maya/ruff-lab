@@ -146,10 +146,13 @@ impl Ranges {
             .chain(self.0.range(from..to).map(|(&s, &e)| (s, e)))
     }
 
+    /// Soft-census / Drop follow-ups (Belobug #477); kept for the unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn remove(&mut self, from: usize, to: usize) {
         if from >= to {
             return;
@@ -166,14 +169,17 @@ impl Ranges {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn covers(&self, from: usize, to: usize) -> bool {
         from >= to || self.0.range(..=from).next_back().is_some_and(|(_, &e)| e >= to)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn contains(&self, at: usize) -> bool {
         self.0.range(..=at).next_back().is_some_and(|(_, &e)| e > at)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.0.iter().map(|(&s, &e)| (s, e))
     }
