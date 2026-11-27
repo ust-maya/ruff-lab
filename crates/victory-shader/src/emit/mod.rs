@@ -264,6 +264,9 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// Root UAV slots an emitted store/atomic may write (selective writeback;
+    /// Marvisak/VIctory #3548). Empty means no classified root-UAV write.
+    pub written_root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
     /// Table descriptors `(root parameter, dword offset in table)` whose
@@ -704,6 +707,7 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: l.half_views,
     };
@@ -1080,6 +1084,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
         };
@@ -1093,6 +1098,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
             })
@@ -1417,6 +1423,26 @@ mod tests {
     /// checks (tests, debug) any read below an element that starts at z or
     /// w panicked, whichever row it was in (found by random-input testing).
     #[test]
+    fn root_uav_write_classification() {
+        use super::bitcode::Attr;
+        use super::shader::Shader;
+        let mut s = Shader::new(false);
+        let b = s.m.new_block();
+        let uav_h1 = s.root_uav_handle(1);
+        let uav_h2 = s.root_uav_handle(2);
+        let uav_h5 = s.root_uav_handle(5);
+        // BufferLoad (68): read-only.
+        s.op(b, "bufferLoad", Attr::ReadNone, s.t.i32, 68, &[uav_h1]);
+        assert!(!s.written_root_uavs.contains(&1));
+        // RawBufferStore (140): write.
+        s.op(b, "rawBufferStore", Attr::NoUnwind, s.t.void, 140, &[uav_h2]);
+        assert!(s.written_root_uavs.contains(&2));
+        assert!(!s.written_root_uavs.contains(&1));
+        s.op(b, "rawBufferStore", Attr::NoUnwind, s.t.void, 140, &[uav_h5]);
+        assert!(s.written_root_uavs.contains(&5));
+    }
+
+    #[test]
     fn reading_a_channel_below_an_input_element_does_not_underflow() {
         // v_interp_mov_f32 v3, p0, attr0.z; s_endpgm
         let words = [0xC80E_0202u32, 0xBF81_0000];
@@ -1582,6 +1608,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
                 root_indexed_views: Vec::new(),
                 half_views: l.half_views,
             };

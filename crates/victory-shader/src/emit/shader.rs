@@ -162,6 +162,9 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Root UAV slots through which an emitted operation may write
+    /// (Marvisak/VIctory #3548 selective writeback).
+    pub written_root_uavs: Vec<u8>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -222,6 +225,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
             #[cfg(test)]
@@ -257,6 +261,16 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // Track which root UAV slots an emitted operation can write through.
+        // Opcode 68: BufferLoad, 72: GetDimensions, 139: RawBufferLoad. Any
+        // other opcode (stores, atomics) is treated as a write.
+        if !matches!(opcode, 68 | 72 | 139)
+            && let Some(first) = args.first()
+            && let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
+            && !self.written_root_uavs.contains(&slot)
+        {
+            self.written_root_uavs.push(slot);
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);

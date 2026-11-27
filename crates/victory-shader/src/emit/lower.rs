@@ -60,6 +60,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See [`super::HostShader::written_root_uavs`].
+    pub written_root_uavs: Vec<u8>,
     /// See [`super::HostShader::half_views`].
     pub half_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
@@ -1331,6 +1333,14 @@ fn d16_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_D16_BITS").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_BFI=1`: lower `s_bfm_b32` / `v_bfm_b32` with one DXIL `Bfi`
+/// (Marvisak/VIctory #3525 / #3528). Off by default; the switch is part of
+/// `translation_fingerprint`, so enabling it misses the warm shader cache.
+fn bfi_masks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BFI").is_some_and(|v| v == "1"))
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -2463,6 +2473,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let written_root_uavs = std::mem::take(&mut self.s.written_root_uavs);
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
@@ -2472,6 +2483,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            written_root_uavs,
             half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
@@ -5698,14 +5710,37 @@ impl<'a> Lower<'a> {
                 }
             }
             "s_bfm_b32" => {
-                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k31 = self.s.m.i32(31);
-                let one = self.s.m.i32(1);
-                let a = self.s.m.bin(c, Bin::And, a, k31);
-                let b = self.s.m.bin(c, Bin::And, b, k31);
-                let m = self.s.m.bin(c, Bin::Shl, one, a);
-                let m = self.s.m.bin(c, Bin::Sub, m, one);
-                (self.s.m.bin(c, Bin::Shl, m, b), None)
+                let (width, offset) = (src32(self, 0)?, src32(self, 1)?);
+                // `VICTORY_BFI=1`: one DXIL Bfi (or an immediate mask) instead
+                // of five ALU ops. Off by default; invalidates the shader /
+                // pipeline cache via `translation_fingerprint` (switch list).
+                if bfi_masks() {
+                    let immediate = self.s.m.int_value(width).zip(self.s.m.int_value(offset));
+                    let mask = if let Some((width, offset)) = immediate {
+                        let (width, offset) = (width as u32 & 31, offset as u32 & 31);
+                        self.s.m.i32(((1u32 << width) - 1) << offset)
+                    } else {
+                        let ones = self.s.m.i32(u32::MAX);
+                        let zero = self.s.m.i32(0);
+                        self.s.op(
+                            c,
+                            "quaternary.i32",
+                            Attr::ReadNone,
+                            self.s.t.i32,
+                            53,
+                            &[width, offset, ones, zero],
+                        )
+                    };
+                    (mask, None)
+                } else {
+                    let k31 = self.s.m.i32(31);
+                    let one = self.s.m.i32(1);
+                    let a = self.s.m.bin(c, Bin::And, width, k31);
+                    let b = self.s.m.bin(c, Bin::And, offset, k31);
+                    let m = self.s.m.bin(c, Bin::Shl, one, a);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    (self.s.m.bin(c, Bin::Shl, m, b), None)
+                }
             }
             _ => return Err(name),
         };
@@ -9224,11 +9259,24 @@ impl<'a> Lower<'a> {
             "v_bfm_b32" => {
                 // ((1 << src0[4:0]) - 1) << src1[4:0]
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let one = k(self, 1);
-                let (a, b) = (m31(self, a), m31(self, b));
-                let m = self.s.m.bin(c, Bin::Shl, one, a);
-                let m = self.s.m.bin(c, Bin::Sub, m, one);
-                self.s.m.bin(c, Bin::Shl, m, b)
+                // `VICTORY_BFI=1`: one DXIL Bfi. Off by default (cache key).
+                if bfi_masks() {
+                    let (ones, zero) = (k(self, u32::MAX), k(self, 0));
+                    self.s.op(
+                        c,
+                        "quaternary.i32",
+                        Attr::ReadNone,
+                        self.s.t.i32,
+                        53,
+                        &[a, b, ones, zero],
+                    )
+                } else {
+                    let one = k(self, 1);
+                    let (a, b) = (m31(self, a), m31(self, b));
+                    let m = self.s.m.bin(c, Bin::Shl, one, a);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    self.s.m.bin(c, Bin::Shl, m, b)
+                }
             }
             "v_cvt_pk_u8_f32" => {
                 // src0 rounded to nearest even and saturated to a byte, into

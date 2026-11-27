@@ -187,6 +187,7 @@ fn build(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: lowered.half_views,
     };

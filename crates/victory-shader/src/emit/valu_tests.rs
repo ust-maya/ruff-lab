@@ -223,6 +223,7 @@ fn lower_words(words: Vec<u32>, threads: u32, lds_bytes: u32, rsrc2: u32) -> Hos
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
     };
@@ -1668,6 +1669,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
         root_indexed_views: Vec::new(),
         half_views: lowered.half_views,
     };
@@ -1873,6 +1875,7 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: lowered.half_views,
     };
@@ -2029,6 +2032,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
     };
@@ -2287,6 +2291,7 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            written_root_uavs: l.written_root_uavs,
             root_indexed_views: res.root_indexed_views,
             half_views: l.half_views,
         }

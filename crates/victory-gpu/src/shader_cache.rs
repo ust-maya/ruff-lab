@@ -230,7 +230,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs, &s.written_root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
@@ -308,6 +308,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let written_root_uavs = r.list()?;
     let n = r.word()? as usize;
     let mut root_indexed_views = Vec::with_capacity(n.min(256));
     for _ in 0..n {
@@ -333,6 +334,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        written_root_uavs,
         root_indexed_views,
         half_views,
     })
@@ -362,6 +364,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
+            written_root_uavs: vec![1],
             root_indexed_views: vec![RootIndexedView {
                 table_slot: 1,
                 constant_slot: 2,
@@ -425,5 +428,19 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn cache_invalidation_on_write_classification_change() {
+        let mut s1 = shader();
+        s1.written_root_uavs = vec![1];
+        let b1 = encode(&s1);
+        assert_eq!(decode(&b1), Some(s1.clone()));
+
+        let mut s2 = s1.clone();
+        s2.written_root_uavs = vec![];
+        let b2 = encode(&s2);
+        assert_ne!(b1, b2);
+        assert_eq!(decode(&b2), Some(s2));
     }
 }

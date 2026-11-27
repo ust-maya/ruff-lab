@@ -230,6 +230,14 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
+/// Skip root-UAV snapshot/writeback for slots the shader only reads
+/// (`written_root_uavs` from emit). Off by default; `VICTORY_SELECTIVE_UAV_WRITEBACK=1`
+/// turns it on (Marvisak/VIctory #3548 writeback half — not the indirect window).
+fn selective_uav_writeback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SELECTIVE_UAV_WRITEBACK").is_some_and(|v| v == "1"))
+}
+
 /// A run of indirect records clamped in one pass ([`windows`]): the host
 /// copy they came from (its number), their kind and stride, the offset of
 /// the first in that copy, how many, and the list's scratch buffer that
@@ -1518,7 +1526,12 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                let writes_slot = if selective_uav_writeback() {
+                    !write_skip() || t.host.written_root_uavs.contains(&slot)
+                } else {
+                    writes
+                };
+                if !self.root_uav(list, address, param, compute, writes_slot) {
                     return false;
                 }
             }
