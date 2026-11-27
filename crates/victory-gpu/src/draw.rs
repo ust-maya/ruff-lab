@@ -307,6 +307,21 @@ fn tabled_buffers() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// Whether `heap_buffers` leaves per-draw table slots to the draws that
+/// already mirrored them (`VICTORY_HEAP_SKIP_TABLED=1`; off by default).
+///
+/// `VICTORY_TABLED_BUFFERS` stamps those slots, and `sync_heaps` honours the
+/// stamp, but the draw calls `HostHeap::mirror` before the stamp: the slot
+/// lands in `changed`, and the once-per-frame pass mirrored it again and
+/// refreshed its whole span (the ~50 ms second walk of run 200). Draws
+/// still refresh the range they read (`readable`). Requires
+/// `VICTORY_TABLED_BUFFERS` (default on). `VICTORY_HEAP_SYNC_TABLES=1`
+/// keeps the slots in the pass, as `mirror_copied` does.
+fn heap_skip_tabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SKIP_TABLED").is_some_and(|v| v == "1"))
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -497,6 +512,9 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Buffer-view slots `heap_buffers` did not re-mirror because a draw had
+/// marked them tabled (`VICTORY_HEAP_SKIP_TABLED=1`), since the last frame line.
+pub(crate) static HEAP_TABLED_SKIPPED: AtomicU64 = AtomicU64::new(0);
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1742,6 +1760,14 @@ impl State {
             if slice_idx == 0 && !ranges.is_empty() {
                 ranges.retain(|&k, _| host.has_buffer_slot(k));
             }
+        }
+        // Per-draw table slots were mirrored by the draw that stamped them.
+        // Walking them again here is the second pass `VICTORY_TABLED_BUFFERS`
+        // was meant to stop; the stamp alone never reached this list.
+        if tabled_buffers() && heap_skip_tabled() {
+            let before = slots.len();
+            slots.retain(|&index| !host.left_to_draws(index));
+            HEAP_TABLED_SKIPPED.fetch_add((before - slots.len()) as u64, Ordering::Relaxed);
         }
         // Whether the device was there before the pass: a view that removes
         // it is named below.

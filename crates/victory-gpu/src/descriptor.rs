@@ -169,6 +169,13 @@ fn mirror(handle: u64) {
 /// few hundred views made by calls; without it those host slots stayed
 /// null, or went on showing what they showed before.
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
+///
+/// Two opt-in cuts on the same pass (`VICTORY_HEAP_SYNC_SKIP=1`,
+/// `VICTORY_HEAP_SYNC_BATCH=1`; both off by default, so the reads stay one
+/// page at a time). Per-draw tables dirty the same heap every frame, and
+/// [`host::HostHeap::mirror_copied`] already leaves those slots to their
+/// draws: the page was still read first. A failed batched read falls back
+/// to the per-page read, so one unmapped page does not drop its neighbours.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -180,6 +187,9 @@ pub(crate) fn sync_heaps() {
     let mut pages = 0u64;
     let mut looked = 0u64;
     let mut mirrored = 0u64;
+    let mut skipped = 0u64;
+    let batch = heap_sync_batch();
+    let skip_tabled = heap_sync_skip();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped under write lock).
@@ -193,56 +203,59 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        let mut work: Vec<(usize, usize)> = Vec::new();
+        let mut pages_touched: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
                 let to = (page + crate::watch::PAGE).min(range_end);
-                work.push((from, to));
+                pages_touched.push((from, to));
                 page += crate::watch::PAGE;
             }
         }
+        let reads = plan_sync_reads(&pages_touched, batch, |from, to| {
+            if !skip_tabled {
+                return false;
+            }
+            let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+            let first = slots.start as u32;
+            let last = slots.end as u32;
+            if first >= last || host.records_left_to_draws(first, last) {
+                skipped += 1;
+                true
+            } else {
+                false
+            }
+        });
         let process = |chunk: &[(usize, usize)]| -> (u64, u64, u64) {
             let (mut p, mut l, mut m) = (0u64, 0u64, 0u64);
-            let mut page_bytes: Vec<u8> = Vec::with_capacity(crate::watch::PAGE);
+            let mut page_bytes: Vec<u8> = Vec::with_capacity(batch.unwrap_or(crate::watch::PAGE));
+            let mut fallback: Vec<u8> = Vec::new();
             for &(from, to) in chunk {
-                // The page's records are read through the kernel, into a
-                // copy: a page the title unmaps meanwhile fails the read
-                // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    p += 1;
-                    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    for index in slots {
-                        let handle = start + index * step;
-                        // A record that straddles the range's ends is left
-                        // to the range that holds its first byte.
-                        let Some(at) = (handle as usize).checked_sub(from) else {
-                            continue;
-                        };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
-                            continue;
-                        };
-                        l += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            m += 1;
-                        }
-                    }
-                }
+                let (np, nl, nm) = mirror_read(
+                    host,
+                    &mut page_bytes,
+                    &mut fallback,
+                    from,
+                    to,
+                    start,
+                    step,
+                    mirrored_count,
+                );
+                p += np;
+                l += nl;
+                m += nm;
             }
             (p, l, m)
         };
-        if work.len() >= 16 {
+        if reads.len() >= 16 {
             let threads = std::thread::available_parallelism()
                 .map_or(4, |n| (n.get() / 2).clamp(2, 6))
-                .min(work.len() / 8)
+                .min(reads.len() / 8)
                 .max(1);
-            let chunk_len = work.len().div_ceil(threads);
+            let chunk_len = reads.len().div_ceil(threads);
             let totals: Vec<(u64, u64, u64)> = std::thread::scope(|s| {
-                let handles: Vec<_> = work
+                let handles: Vec<_> = reads
                     .chunks(chunk_len)
                     .map(|c| s.spawn(move || process(c)))
                     .collect();
@@ -254,39 +267,198 @@ pub(crate) fn sync_heaps() {
                 mirrored += m;
             }
         } else {
-            let (p, l, m) = process(&work);
+            let (p, l, m) = process(&reads);
             pages += p;
             looked += l;
             mirrored += m;
         }
     }
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
+    for (count, n) in SYNCED.iter().zip([
+        pages,
+        looked,
+        mirrored,
+        started.elapsed().as_micros() as u64,
+        skipped,
+    ]) {
         count.fetch_add(n, Relaxed);
     }
 }
 
+/// Largest read [`sync_heaps`] issues when `VICTORY_HEAP_SYNC_BATCH` is set.
+/// `None`: one dirty watch page (64 KiB, [`crate::watch::PAGE`]) per read,
+/// as before. `1` is 1 MiB; any other value is a KiB count clamped to
+/// 128..=4096 (two watch pages through 4 MiB). A failed read is retried
+/// page by page.
+#[cfg(windows)]
+fn heap_sync_batch() -> Option<usize> {
+    static ON: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_HEAP_SYNC_BATCH").ok().as_deref() {
+        None | Some("0") => None,
+        Some("1") => Some(1 << 20),
+        Some(v) => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .map(|kb| kb.clamp(128, 4096) << 10),
+    })
+}
+
+/// Whether [`sync_heaps`] skips a dirty page whose every host slot is left
+/// to its draws (`VICTORY_HEAP_SYNC_SKIP=1`; off by default).
+#[cfg(windows)]
+fn heap_sync_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_SKIP").is_some_and(|v| v == "1"))
+}
+
+/// Reads `[from, to)` and mirrors the descriptor records in it.
+///
+/// One read of the whole span. If that fails (a page unmapped under the
+/// span), each page is read alone: the page that fails is left, and the
+/// others are still mirrored. Returns pages read, slots looked at, slots
+/// mirrored.
+#[cfg(windows)]
+fn mirror_read(
+    host: &host::HostHeap,
+    buf: &mut Vec<u8>,
+    fallback: &mut Vec<u8>,
+    from: usize,
+    to: usize,
+    heap_start: u64,
+    step: u64,
+    mirrored_count: u32,
+) -> (u64, u64, u64) {
+    if from >= to {
+        return (0, 0, 0);
+    }
+    buf.resize(to - from, 0);
+    if crate::host::read_into(from as *const u8, buf) {
+        let (looked, mirrored) = mirror_records(host, from, buf, heap_start, step, mirrored_count);
+        return (page_pieces(from, to, crate::watch::PAGE), looked, mirrored);
+    }
+    if to - from <= crate::watch::PAGE {
+        return (0, 0, 0);
+    }
+    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    let mut page = from & !(crate::watch::PAGE - 1);
+    while page < to {
+        let start = page.max(from);
+        let end = (page + crate::watch::PAGE).min(to);
+        fallback.resize(end - start, 0);
+        if crate::host::read_into(start as *const u8, fallback) {
+            pages += 1;
+            let (l, m) = mirror_records(host, start, fallback, heap_start, step, mirrored_count);
+            looked += l;
+            mirrored += m;
+        }
+        page += crate::watch::PAGE;
+    }
+    (pages, looked, mirrored)
+}
+
+/// How many `page`-sized pieces `[from, to)` covers (the frame line's page count).
+fn page_pieces(from: usize, to: usize, page: usize) -> u64 {
+    if from >= to || page == 0 {
+        return 0;
+    }
+    let mut n = 0u64;
+    let mut at = from & !(page - 1);
+    while at < to {
+        n += 1;
+        at += page;
+    }
+    n
+}
+
+/// Mirrors descriptor records in `bytes`, which were read from `base`.
+#[cfg(windows)]
+fn mirror_records(
+    host: &host::HostHeap,
+    base: usize,
+    bytes: &[u8],
+    heap_start: u64,
+    step: u64,
+    mirrored_count: u32,
+) -> (u64, u64) {
+    let mut looked = 0u64;
+    let mut mirrored = 0u64;
+    let slots = changed_slots(base, base + bytes.len(), heap_start as usize, step, mirrored_count);
+    for index in slots {
+        let handle = heap_start + index * step;
+        // A record that straddles the range's ends is left to the range
+        // that holds its first byte.
+        let Some(at) = (handle as usize).checked_sub(base) else {
+            continue;
+        };
+        let Some(record) = bytes.get(at..at + step as usize) else {
+            continue;
+        };
+        looked += 1;
+        if host.mirror_copied(index as u32, handle, record) {
+            mirrored += 1;
+        }
+    }
+    (looked, mirrored)
+}
+
+/// Groups dirty page spans into the reads [`sync_heaps`] will issue.
+///
+/// `skip` drops a span (a page left entirely to per-draw tables). `batch`
+/// joins adjacent kept spans up to that many bytes; spans with a gap
+/// between them stay apart, so a skipped page is not read as part of its
+/// neighbours. `None` keeps one read per remaining span.
+pub(crate) fn plan_sync_reads(
+    pages: &[(usize, usize)],
+    batch: Option<usize>,
+    mut skip: impl FnMut(usize, usize) -> bool,
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for &(from, to) in pages {
+        if from >= to || skip(from, to) {
+            continue;
+        }
+        if let Some(limit) = batch
+            && let Some(last) = out.last_mut()
+        {
+            let (start, end) = *last;
+            if end == from && to.saturating_sub(start) <= limit {
+                *last = (start, to);
+                continue;
+            }
+        }
+        out.push((from, to));
+    }
+    out
+}
+
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
-/// not the one last seen (mirrored), and the microseconds it took.
+/// not the one last seen (mirrored), the microseconds it took, and pages
+/// not read because every slot on them was left to its draws
+/// (`VICTORY_HEAP_SYNC_SKIP=1`).
 #[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
-/// Nothing while no heap page changed.
+/// Nothing while no heap page changed and none was skipped.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
-    if pages == 0 {
+    let [pages, looked, mirrored, micros, skipped] =
+        [0, 1, 2, 3, 4].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    if pages == 0 && skipped == 0 {
         return;
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms",
+         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \
+         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.0} pages not read \
+         (VICTORY_HEAP_SYNC_SKIP=1; batched reads VICTORY_HEAP_SYNC_BATCH=1), {:.2} ms",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
+        skipped as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
 }
@@ -1183,6 +1355,37 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn sync_reads_stay_per_page_until_a_batch_is_asked_for() {
+        let page = 64 << 10;
+        let pages: Vec<_> = (0..4).map(|i| (i * page, (i + 1) * page)).collect();
+        assert_eq!(plan_sync_reads(&pages, None, |_, _| false), pages);
+        assert_eq!(
+            plan_sync_reads(&pages, Some(page), |_, _| false),
+            pages,
+            "a batch of one watch page does not join neighbours"
+        );
+        assert_eq!(
+            plan_sync_reads(&pages, Some(2 * page), |_, _| false),
+            vec![(0, 2 * page), (2 * page, 4 * page)]
+        );
+        assert_eq!(
+            plan_sync_reads(&pages, Some(1 << 20), |_, _| false),
+            vec![(0, 4 * page)]
+        );
+    }
+
+    #[test]
+    fn sync_reads_do_not_cross_a_skipped_page() {
+        let page = 64 << 10;
+        let pages: Vec<_> = (0..4).map(|i| (i * page, (i + 1) * page)).collect();
+        let kept = plan_sync_reads(&pages, Some(1 << 20), |from, _| from == page);
+        assert_eq!(kept, vec![(0, page), (2 * page, 4 * page)]);
+        assert!(plan_sync_reads(&pages, Some(1 << 20), |_, _| true).is_empty());
+        assert_eq!(page_pieces(page / 2, page + 8, page), 2);
+        assert_eq!(page_pieces(0, 0, page), 0);
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
