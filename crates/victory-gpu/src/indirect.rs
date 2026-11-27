@@ -460,6 +460,92 @@ fn record_clamp_as(
     true
 }
 
+/// How clamps of indirect draws are recorded: 0 each before its draw (old
+/// path, the default); 1 in a list of their own before the list that draws;
+/// 2 as 1, with a barrier for shader writes before each draw; 3 as 1 for mesh
+/// only; 4 as 1 for draws only; 5 as 1 with a new list for the clamps always;
+/// 6 the lists cut as for 1 with each clamp before its draw; 7 as 1 with
+/// scoped UAV barriers between clamps (recommended when enabling).
+/// `VICTORY_HOIST_CLAMPS=<n>` sets it (unset / 0 keeps the old path).
+pub(crate) fn hoist_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("VICTORY_HOIST_CLAMPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Whether clamps of indirect draws go to a list before the one that draws.
+pub(crate) fn hoisting() -> bool {
+    hoist_mode() != 0
+}
+
+/// As [`bound`], recorded in `clamps`, a list that runs before the one that
+/// executes: the buffer and the offset of the clamped records, readable as
+/// indirect arguments once `clamps` ended ([`HostList::clamp_end`]).
+pub(crate) fn bound_before(
+    clamps: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+    if records == 0 {
+        return None;
+    }
+    let (c, (budget, budget_res)) = (clamp()?, clamps.budget_with_resource()?);
+    // SAFETY: live buffers.
+    let (src_base, count_base) = unsafe {
+        (
+            src.GetGPUVirtualAddress(),
+            count.map(|(b, _)| b.GetGPUVirtualAddress()),
+        )
+    };
+    let fits = |offset: u64, len: u64| {
+        offset
+            .checked_add(len)
+            .is_some_and(|end| end <= u64::from(u32::MAX))
+    };
+    let (src_gpu, args_offset) = if fits(src_offset, bytes) {
+        (src_base, src_offset as u32)
+    } else {
+        (src_base.checked_add(src_offset)?, 0)
+    };
+    let (count_gpu, has_count, count_offset) = match (count, count_base) {
+        (Some((_, off)), Some(base)) if fits(off, 4) => (base, 1u32, off as u32),
+        (Some((_, off)), Some(base)) => (base.checked_add(off)?, 1, 0),
+        _ => (src_gpu, 0, 0),
+    };
+    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (dst, at) = clamps.clamp_room(bytes)?;
+    // SAFETY: a live buffer.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let constants = [kind, stride, records, args_offset, has_count, count_offset];
+    let l = &clamps.list;
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // count, destination (writable: `clamp_room`) and budget buffers.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        // Mode 7: order budget updates across consecutive clamps without a
+        // full-GPU global UAV drain (destination offsets are disjoint).
+        if hoist_mode() == 7 {
+            l.ResourceBarrier(&[uav_barrier_on(budget_res)]);
+        }
+    }
+    Some((dst, at))
+}
+
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
@@ -478,12 +564,23 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+    uav_barrier_on_opt(None)
+}
+
+fn uav_barrier_on(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    uav_barrier_on_opt(Some(resource))
+}
+
+fn uav_barrier_on_opt(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
+                // SAFETY: barrier borrows; never releases. None = global UAV.
+                pResource: std::mem::ManuallyDrop::new(resource.map(|r| unsafe {
+                    std::mem::transmute_copy(r)
+                })),
             }),
         },
     }

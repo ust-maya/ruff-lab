@@ -425,13 +425,24 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// and no other piece is. Ranges sent up lie close together (514 a frame
 /// for 87 MB in run 102), and each had a pass of its own over its pieces,
 /// so a piece that held several ranges was hashed once for each.
-pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
+#[cfg(test)]
+pub(crate) fn joined_piece_runs(runs: Vec<CardSpan>) -> Vec<CardSpan> {
+    joined_piece_runs_within(runs, 0)
+}
+
+/// Joins piece runs that touch or are separated by at most `max_gap` 64 KiB
+/// pieces (`VICTORY_CARD_REHASH_GAP`). Bridging a few unchanged pieces inside
+/// one dispatch cuts small `Dispatch` launches per frame.
+pub(crate) fn joined_piece_runs_within(mut runs: Vec<CardSpan>, max_gap: u32) -> Vec<CardSpan> {
     runs.sort_unstable_by_key(|r| r.first);
     let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
-                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+            Some(last)
+                if run.first <= last.first.saturating_add(last.pieces).saturating_add(max_gap) =>
+            {
+                let end = (last.first + last.pieces).max(run.first + run.pieces);
+                last.pieces = end - last.first;
                 last.to = last.to.max(run.to);
             }
             _ => out.push(run),
@@ -476,7 +487,10 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{
+        CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs,
+        joined_piece_runs_within,
+    };
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -498,6 +512,13 @@ mod card_tests {
         assert_eq!(joined.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(), [(3, 5), (9, 1), (40, 3), (100, 1)]);
         assert!(joined.iter().all(|r| r.skew == 7));
         assert!(joined_piece_runs(Vec::new()).is_empty());
+        // Gap of 3 joins 9 into the 3..8 run (first 3, pieces 5 → end 8; 9 is 1 away).
+        let gapped = vec![run(3, 5), run(9, 1), run(40, 1)];
+        let bridged = joined_piece_runs_within(gapped, 3);
+        assert_eq!(
+            bridged.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(),
+            [(3, 7), (40, 1)]
+        );
     }
 
     /// The offsets the compare's shader takes for a piece (`CARD_COMPARE`
