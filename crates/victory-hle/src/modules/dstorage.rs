@@ -991,6 +991,13 @@ fn execute(request: &Request, pages: Option<&PageRuns>) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
+        // Physical pages are written in place a run of one section's pages
+        // at a time (`VICTORY_SECTION_MB`), so consecutive pages of one
+        // allocation that span several sections need no buffer either
+        // (Marvisak/VIctory#3177).
+        if options & PAGE_DESTINATION != 0 {
+            return copy_into_destination(request, pages, size).map_err(|hr| fail(hr, "copying"));
+        }
         // A file read into a title address is the kernel's write, and the
         // kernel does not fault into the GPU side's guard: a block guarded
         // again between `kernel_will_write` and the read (the guard over all
@@ -999,13 +1006,13 @@ fn execute(request: &Request, pages: Option<&PageRuns>) -> Result<(), HRESULT> {
         // at the failed request (runs amd-C and amd-C2, seconds after the
         // world's first frame). It is read beside and copied in: our copy
         // faults into the guard like the title's own writes.
-        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
+        let bounce = options & MEMORY_SOURCE == 0;
         return into_destination(request, pages, size, |out| {
             if !bounce {
-                return read_into(request, out).map(|()| size);
+                return read_into(request, 0, out).map(|()| size);
             }
             let mut data = vec![0; size];
-            read_into(request, &mut data)?;
+            read_into(request, 0, &mut data)?;
             out.copy_from_slice(&data);
             Ok(size)
         })
@@ -1134,7 +1141,7 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
         return Ok(Cow::Borrowed(bytes));
     }
     let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
+    read_into(request, 0, &mut bytes)?;
     Ok(Cow::Owned(bytes))
 }
 
@@ -1175,11 +1182,15 @@ impl Drop for ReadEvent {
     }
 }
 
-/// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+/// Fills `out` with source bytes `[at, at + out.len())`, from the
+/// request's file or memory.
+fn read_into(request: &Request, at: usize, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `out.len()` bytes until completion.
-        out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        // SAFETY: the title's source holds `source_size` bytes until
+        // completion, at least `at + out.len()`.
+        out.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(request.source.cast::<u8>().add(at), out.len())
+        });
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
@@ -1198,7 +1209,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
                 break Ok(());
             }
             let chunk = (out.len() - done).min(u32::MAX as usize) as u32;
-            let pos = request.offset + done as u64;
+            let pos = request.offset + (at + done) as u64;
             // SAFETY: zero-initialized Win32 OVERLAPPED with offset + event.
             let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
             ov.Anonymous.Anonymous.Offset = pos as u32;
@@ -1237,7 +1248,10 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
             if done == out.len() {
                 break Ok(());
             }
-            match file_obj.file.seek_read(&mut out[done..], request.offset + done as u64) {
+            match file_obj
+                .file
+                .seek_read(&mut out[done..], request.offset + (at + done) as u64)
+            {
                 Ok(0) => break Err(END_OF_FILE),
                 Ok(n) => done += n,
                 Err(error) => break Err(from_win32(&error)),
@@ -1246,6 +1260,57 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+/// Copies the request's first `len` source bytes to its physical-page
+/// destination. Fills each section run in place when the list is known
+/// (Marvisak/VIctory#3177); otherwise falls back to [`into_destination`].
+fn copy_into_destination(
+    request: &Request,
+    pages: Option<&PageRuns>,
+    len: usize,
+) -> Result<(), HRESULT> {
+    let offset = (request.page_offset & 0xffff) as usize;
+    let late;
+    let runs = match pages {
+        Some(runs) => Some(runs),
+        None => {
+            // SAFETY: the title passes a page number per 64 KiB of
+            // destination, which holds at least `len` bytes from `offset`.
+            let pages = unsafe {
+                std::slice::from_raw_parts(
+                    request.destination.cast::<usize>(),
+                    (offset + len).div_ceil(PAGE),
+                )
+            };
+            late = super::xmem::resolve_pages(pages, offset, len);
+            late.as_ref()
+        }
+    };
+    if let Some(runs) = runs {
+        match runs.fill(len, |at, out| read_into(request, at, out)) {
+            Some(Ok(())) => {
+                runs.written(len);
+                return Ok(());
+            }
+            Some(Err(hr)) => return Err(hr),
+            None => {
+                // A view failed part way: retry through a buffer as before.
+                #[cfg(test)]
+                tests::STAGED.with(|n| n.set(n.get() + 1));
+                let mut data = vec![0; len];
+                read_into(request, 0, &mut data)?;
+                if runs.write(&data) {
+                    runs.written(len);
+                    return Ok(());
+                }
+                return Err(E_INVALIDARG);
+            }
+        }
+    }
+    into_destination(request, pages, len, |out| {
+        read_into(request, 0, out).map(|()| len)
+    })
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1400,6 +1465,11 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        /// Physical-page destinations this thread wrote through a buffer
+        /// after an in-place fill across sections failed a view.
+        pub(super) static STAGED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
@@ -1884,6 +1954,96 @@ mod tests {
         // SAFETY: both pages are mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
+    }
+
+    /// Consecutive pages of one allocation in 2 MiB sections: a copy that
+    /// crosses sections is written into each section's pages in place, no
+    /// buffer, from memory or from a file (Marvisak/VIctory#3177).
+    #[test]
+    fn copies_across_sections_need_no_buffer() {
+        use crate::modules::xmem;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        const MIB: usize = 1 << 20;
+        let mut pages = xmem::tests::allocate_in(130, 32);
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            pages.len() * PAGE,
+            0x2000 | 0x2040_0000,
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, pages.len(), pages.as_ptr()),
+            mapped
+        );
+        let mapped_bytes = mapped.cast::<u8>();
+        let shapes = [
+            (2 * MIB - PAGE / 2, PAGE),
+            (2 * MIB - 100, 200),
+            (PAGE + 123, 4 * MIB),
+            (3 * PAGE + 5, 6 * MIB + 999),
+            (PAGE, 8 * MIB),
+            (1, 130 * PAGE - 2),
+        ];
+        let prefix = 777;
+        for (start, len) in shapes {
+            let plain = pattern(prefix + len);
+            let (_dir, file) = file_with(&plain);
+            let from_memory = plain[prefix..].iter().map(|&b| !b).collect::<Vec<_>>();
+            let (first, within) = (start / PAGE, start % PAGE);
+            assert!(xmem::page_window(&pages[first..], within, len).is_none());
+            for (options, source, offset, expected) in [
+                (
+                    MEMORY_SOURCE,
+                    from_memory.as_ptr().cast(),
+                    0u64,
+                    &from_memory[..],
+                ),
+                (0, file.cast_const(), prefix as u64, &plain[prefix..]),
+            ] {
+                // SAFETY: the mapped range holds both bytes beside the destination.
+                unsafe {
+                    mapped_bytes.add(start - 1).write(0xa7);
+                    mapped_bytes.add(start + len).write(0x39);
+                }
+                let mut r = request(
+                    PAGE_DESTINATION | options,
+                    pages[first..].as_mut_ptr().cast(),
+                    len,
+                    source,
+                    offset,
+                    len,
+                );
+                r.page_offset = within as u64;
+                let staged = STAGED.with(std::cell::Cell::get);
+                execute(&r, None).expect("a copy across sections");
+                assert_eq!(
+                    STAGED.with(std::cell::Cell::get),
+                    staged,
+                    "{start}+{len}: no buffer"
+                );
+                // SAFETY: the call is synchronous and the whole range is mapped.
+                let (written, beside) = unsafe {
+                    (
+                        std::slice::from_raw_parts(mapped_bytes.add(start), len),
+                        [
+                            mapped_bytes.add(start - 1).read(),
+                            mapped_bytes.add(start + len).read(),
+                        ],
+                    )
+                };
+                assert!(written == expected, "{start}+{len}: every byte in place");
+                assert_eq!(beside, [0xa7, 0x39], "{start}+{len}: nothing beside");
+            }
+        }
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, pages.len(), std::ptr::null()),
+            mapped
+        );
+        assert_eq!(xmem::XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+        // SAFETY: this test's reservation, all placeholder again.
+        assert_ne!(unsafe { VirtualFree(mapped, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
