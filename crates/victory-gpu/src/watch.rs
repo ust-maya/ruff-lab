@@ -483,18 +483,46 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 }
 
 impl Tracked {
+    /// What [`Tracked::take`] would return, without marking anything seen,
+    /// plus the per-page journal generation (`write`) of every included
+    /// page: the prep worker's non-destructive look, so the destructive
+    /// `take` (and its journal re-ask after any relay landing) stays on
+    /// the submitter under the submission lock. The prep path compares
+    /// generations so a write landing on an already-dirty page
+    /// mid-prefetch (relay copy-back or a title heap copy: same range,
+    /// only the stamp advances) re-reads that page instead of mirroring
+    /// stale prefetched bytes.
+    pub(crate) fn peek_stamped(
+        &self,
+        from: usize,
+        to: usize,
+    ) -> (Vec<(usize, usize)>, Vec<(usize, u64)>) {
+        self.collect(from, to, false)
+    }
+
     /// Takes changed pages of `[from, to)`, cut to the tracked range. A
     /// partial page stays changed so a later take can read its other bytes.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        self.collect(from, to, true).0
+    }
+
+    /// [`Tracked::take`] plus the per-page journal generation of every
+    /// included page (see [`Tracked::peek_stamped`]).
+    pub(crate) fn take_stamped(&self, from: usize, to: usize) -> (Vec<(usize, usize)>, Vec<(usize, u64)>) {
+        self.collect(from, to, true)
+    }
+
+    fn collect(&self, from: usize, to: usize, destructive: bool) -> (Vec<(usize, usize)>, Vec<(usize, u64)>) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from >= to {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let Some((_, pages)) = writes(from, to, true) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut stamps: Vec<(usize, u64)> = Vec::new();
         for (page, write) in pages {
             if seen.get(&page).is_some_and(|&last| last >= write) {
                 continue;
@@ -503,8 +531,10 @@ impl Tracked {
             if start >= end {
                 continue;
             }
+            stamps.push((page, write));
             // Keep partial pages dirty: the caller has not taken the rest.
-            if (page * PAGE).max(self.start) >= from
+            if destructive
+                && (page * PAGE).max(self.start) >= from
                 && ((page + 1) * PAGE).min(self.end) <= to
             {
                 seen.insert(page, write);
@@ -514,7 +544,7 @@ impl Tracked {
                 _ => ranges.push((start, end)),
             }
         }
-        ranges
+        (ranges, stamps)
     }
 }
 

@@ -931,7 +931,7 @@ mod tests {
         // defer (Err), not panic and not grow the queue unbounded.
         let queue = PrepQueue::new();
         let job =
-            |seq: u64| PrepJob { seq, steps: Vec::new() };
+            |seq: u64| PrepJob { seq, steps: Vec::new(), sync: None };
         assert!(queue.enqueue(job(1)).is_ok(), "first job must fit");
         assert!(queue.enqueue(job(2)).is_ok(), "second job must fit");
         let third = job(3);
@@ -965,6 +965,7 @@ mod tests {
         assert!(prepared.card_ranges.is_empty());
         assert!(prepared.writes.is_empty());
         assert!(prepared.back.is_empty());
+        assert!(prepared.sync.is_none());
     }
 
     #[test]
@@ -979,7 +980,7 @@ mod tests {
             src: 0x2000,
             len: 0x10,
         }];
-        assert!(queue.enqueue(PrepJob { seq: 7, steps: steps.clone() }).is_ok());
+        assert!(queue.enqueue(PrepJob { seq: 7, steps: steps.clone(), sync: None }).is_ok());
         let outcome = queue.wait_done(7, &steps);
         line().written = saved;
         assert_eq!(outcome, WaitOutcome::Ready);
@@ -997,10 +998,50 @@ mod tests {
             src: 0x2500,
             len: 0x10,
         }];
-        assert!(queue.enqueue(PrepJob { seq: 9, steps: steps.clone() }).is_ok());
+        assert!(queue.enqueue(PrepJob { seq: 9, steps: steps.clone(), sync: None }).is_ok());
         let outcome = queue.wait_done(9, &steps);
         line().written = saved;
         assert_eq!(outcome, WaitOutcome::Fallback(WHY_READ));
+    }
+
+    #[test]
+    fn prep_wait_done_fallback_on_sync_overlap() {
+        // Sync planned reads touching LINE.written (or settling) must fall
+        // back with WHY_READ, even when steps themselves do not overlap:
+        // prefetched heap bytes could be what a flight still writes.
+        use crate::descriptor::SyncJob;
+        let queue = PrepQueue::new();
+        queue.start_worker();
+        let saved = std::mem::take(&mut line().written);
+        let saved_settling = line().settling;
+        let saved_in_hand = std::mem::take(&mut line().in_hand);
+        // Steps away from written; sync reads inside written.
+        line().written = vec![(0x8000, 0x9000)];
+        let steps = vec![PrepStep {
+            kind: PrepStepKind::Copy,
+            addr: 0x1000,
+            src: 0x2000,
+            len: 0x10,
+        }];
+        let sync = SyncJob::from_reads(vec![(0x8200, 0x8300)]);
+        assert!(queue.enqueue(PrepJob { seq: 11, steps: steps.clone(), sync: Some(sync.clone()) }).is_ok());
+        let outcome = queue.wait_done(11, &steps);
+        line().written = saved;
+        // Settling alone (with non-empty sync) must also fall back.
+        let queue2 = PrepQueue::new();
+        queue2.start_worker();
+        let saved2 = std::mem::take(&mut line().written);
+        line().settling = true;
+        assert!(queue2.enqueue(PrepJob { seq: 12, steps: steps.clone(), sync: Some(sync) }).is_ok());
+        let outcome2 = queue2.wait_done(12, &steps);
+        {
+            let mut guard = line();
+            guard.written = saved2;
+            guard.settling = saved_settling;
+            guard.in_hand = saved_in_hand;
+        }
+        assert_eq!(outcome, WaitOutcome::Fallback(WHY_READ));
+        assert_eq!(outcome2, WaitOutcome::Fallback(WHY_READ));
     }
 
     #[test]
@@ -2740,9 +2781,10 @@ pub(crate) fn relay() -> bool {
 /// stays on the submitting thread and this is false, so the default path is
 /// a total no-op. With it, [`Host::submit`] takes the `victory-prep`
 /// worker's [`Prepared`] and holds `submitted` only around
-/// `ExecuteCommandLists`+`Signal` (Task 3 limited version: `sync_heaps`
-/// stays under `submitted`, `run_deferred`/`flush`/`take_snapshots` run
-/// under the prep guard without it).
+/// `ExecuteCommandLists`+`Signal` (Task 5: worker prefetches
+/// `sync_heaps` planned-read bytes; CAS/mirror stay under `submitted`,
+/// `run_deferred`/`flush`/`take_snapshots` run under the prep guard
+/// without it).
 pub(crate) fn prep_ahead() -> bool {
     prep_ahead_effective(prep_ahead_flag(), late(), relay())
 }
@@ -2777,9 +2819,9 @@ fn prep_ahead_effective(requested: bool, late_on: bool, relay_on: bool) -> bool 
 // done: it never takes `submitted`, `CARD_WORK`, `Host::fence`/`event` or
 // `LINE.written`, and never holds a `HostList` reference across a free.
 // `Host::submit` (Task 3, flag-gated) takes that [`Prepared`] and holds
-// `submitted` only around `ExecuteCommandLists`+`Signal` (plus `sync_heaps`
-// / settle / `card_before`, kept inline under `submitted` in this limited
-// version — see `submit`); `run_deferred`/`flush`/`take_snapshots` run
+// `submitted` only around `ExecuteCommandLists`+`Signal` (plus settle /
+// `card_before` and `sync_heaps` CAS/mirror, kept inline under
+// `submitted` — see `submit`); `run_deferred`/`flush`/`take_snapshots` run
 // under the prep guard without `submitted`, overlapped with the relay
 // landing flights. Any overlap of a Copy/Fill with `LINE.written` falls
 // back to the existing `relay_wait`/`settle` order and inline prepare.
@@ -2857,6 +2899,8 @@ struct Prepared {
     card_ranges: Vec<(usize, usize)>,
     writes: Vec<(usize, crate::queue::Written, usize)>,
     back: Vec<Declared>,
+    /// Worker-prefetched sync reads (None: inline `sync_heaps`).
+    sync: Option<crate::descriptor::SyncJob>,
 }
 
 /// One queued prep: sequence plus owned step descriptors (no refs).
@@ -2865,6 +2909,8 @@ struct Prepared {
 struct PrepJob {
     seq: u64,
     steps: Vec<PrepStep>,
+    /// Injected sync plan (tests) or `None` (the worker prefetches).
+    sync: Option<crate::descriptor::SyncJob>,
 }
 
 /// Result of [`PrepQueue::wait_done`]: `Ready` means the worker marked
@@ -2950,6 +2996,14 @@ impl PrepQueue {
                         Ok(job) => {
                             let seq = job.seq;
                             let steps = job.steps;
+                            // Sync bytes are prefetched here without any
+                            // submitted/CARD_WORK/fence/LINE access (and
+                            // without holding host references); per-copy
+                            // accounting/landing stays on the submitter.
+                            let sync = match job.sync {
+                                Some(injected) => Some(injected),
+                                None => crate::descriptor::prefetch_sync_job(),
+                            };
                             {
                                 let mut map = prepared.lock().unwrap_or_else(|e| e.into_inner());
                                 // Bound the map too (cap 2 per pipeline depth,
@@ -2967,6 +3021,7 @@ impl PrepQueue {
                                         card_ranges: Vec::new(),
                                         writes: Vec::new(),
                                         back: Vec::new(),
+                                        sync,
                                     },
                                 );
                             }
@@ -3006,25 +3061,47 @@ impl PrepQueue {
         self.prepared.lock().unwrap_or_else(|e| e.into_inner()).remove(&seq)
     }
 
-    /// Waits for the worker's mark for `seq`, unless `steps` overlaps
-    /// `LINE.written` (the `late_blocked` overlap), in which case it
-    /// returns [`WaitOutcome::Fallback`] for `relay_wait`/`settle` + inline
-    /// prepare. Bounded by [`PREP_WAIT_TIMEOUT`]: a missing worker, a
-    /// never-enqueued sequence, a disconnected queue, or device removal all
-    /// fall back instead of hanging. Only call for a successfully enqueued
-    /// `seq` (and safe to call otherwise: it just times out).
+    /// Whether the stored [`Prepared`] for `seq` carries sync reads that
+    /// touch `written`/`in_hand` or landing (`settling` with non-empty
+    /// sync). Checked before and after the done-wait so flights sent or
+    /// landed meanwhile are caught.
+    fn prepared_sync_touches(
+        &self,
+        seq: u64,
+        written: &[(usize, usize)],
+        settling: bool,
+        in_hand: &[(usize, usize)],
+    ) -> bool {
+        let map = self.prepared.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(&seq).and_then(|p| p.sync.as_ref()) {
+            Some(sync) => crate::descriptor::sync_job_touches(sync, written, settling, in_hand),
+            None => false,
+        }
+    }
+
+    /// Waits for the worker's mark for `seq`, unless `steps` or the
+    /// worker's sync reads overlap `LINE.written` (the `late_blocked`
+    /// overlap, or a prefetched heap page a flight may still write), in
+    /// which case it returns [`WaitOutcome::Fallback`] for
+    /// `relay_wait`/`settle` + inline prepare (sync overlap is
+    /// `WHY_READ`). Bounded by [`PREP_WAIT_TIMEOUT`]: a missing worker, a
+    /// never-enqueued sequence, a disconnected queue, or device removal
+    /// all fall back instead of hanging. Only call for a successfully
+    /// enqueued `seq` (and safe to call otherwise: it just times out).
     #[allow(dead_code)] // Task 3 overlap submit path consumes this
     fn wait_done(&self, seq: u64, steps: &[PrepStep]) -> WaitOutcome {
         // Overlap short-circuits, exactly as `late_blocked` does in
         // `submit`: Copy/Fill/Texture reads (and any Run) may read title
-        // memory a flight's shaders still write.
-        let written = {
-            let line = line();
-            line.written.clone()
-        };
+        // memory a flight's shaders still write; prefetched heap reads
+        // must not read heap pages the relay is still writing.
+        let (written, settling, in_hand) = line_sync_snapshot();
         if prep_overlaps(steps, &written) {
             PREP_STATS[1].fetch_add(1, Ordering::Relaxed);
             return WaitOutcome::Fallback(prep_fallback_why(steps));
+        }
+        if self.prepared_sync_touches(seq, &written, settling, &in_hand) {
+            PREP_STATS[1].fetch_add(1, Ordering::Relaxed);
+            return WaitOutcome::Fallback(WHY_READ);
         }
         if prep_device_removed() {
             PREP_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -3053,17 +3130,28 @@ impl PrepQueue {
             PREP_STATS[1].fetch_add(1, Ordering::Relaxed);
             return WaitOutcome::Fallback(prep_fallback_why(steps));
         }
-        let written = {
-            let line = line();
-            line.written.clone()
-        };
+        let (written, settling, in_hand) = line_sync_snapshot();
         if prep_overlaps(steps, &written) {
             PREP_STATS[1].fetch_add(1, Ordering::Relaxed);
             return WaitOutcome::Fallback(prep_fallback_why(steps));
         }
+        if self.prepared_sync_touches(seq, &written, settling, &in_hand) {
+            PREP_STATS[1].fetch_add(1, Ordering::Relaxed);
+            return WaitOutcome::Fallback(WHY_READ);
+        }
         PREP_STATS[0].fetch_add(1, Ordering::Relaxed);
         WaitOutcome::Ready
     }
+}
+
+/// Snapshot for overlap checks: `LINE.written` ranges, the `settling`
+/// flag, and `in_hand` landing writes as `(at, at + n)` ranges.
+fn line_sync_snapshot() -> (Vec<(usize, usize)>, bool, Vec<(usize, usize)>) {
+    let line = line();
+    let written = line.written.clone();
+    let settling = line.settling;
+    let in_hand = line.in_hand.iter().map(|(at, _, n)| (*at, *at + *n)).collect();
+    (written, settling, in_hand)
 }
 
 impl Default for PrepQueue {
@@ -3177,6 +3265,7 @@ fn prepare_from_steps(seq: u64, steps: &[Step]) -> Prepared {
         card_ranges: Vec::new(),
         writes: Vec::new(),
         back: Vec::new(),
+        sync: None,
     }
 }
 
@@ -3200,7 +3289,7 @@ fn prepare(seq: u64, runs: &[&HostList], batch: &Batch) -> Prepared {
     }
     let pending = batch.refreshes.iter().map(|(_, from, to)| (*from, *to)).collect();
     let back = declared_writes(runs);
-    Prepared { seq, steps, pending, snapshots: Vec::new(), card_ranges: Vec::new(), writes, back }
+    Prepared { seq, steps, pending, snapshots: Vec::new(), card_ranges: Vec::new(), writes, back, sync: None }
 }
 
 /// The relay's second stage (`VICTORY_RELAY=2`): a submission that reads
@@ -6005,7 +6094,7 @@ impl Host {
                 let deferred = list.deferred();
                 steps.extend(describe_steps(&deferred.copies));
             }
-            match prep_queue().enqueue(PrepJob { seq: seq_peek, steps: steps.clone() }) {
+            match prep_queue().enqueue(PrepJob { seq: seq_peek, steps: steps.clone(), sync: None }) {
                 Ok(()) => {
                     if prep_queue().wait_done(seq_peek, &steps) == WaitOutcome::Ready {
                         prep_taken = prep_queue().take_prepared(seq_peek);
@@ -6046,8 +6135,33 @@ impl Host {
             }
         }
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // command lists that index those slots are submitted. With a
+        // prep hit, the worker's prefetched heap bytes are CAS-mirrored
+        // here under `submitted` after the authoritative settle; any
+        // overlap/validation failure discards them and runs the inline
+        // path byte-identical (`written.take` is only consumed by
+        // `apply_sync_job` on success, so the fallback never loses it).
+        let mut sync_applied = false;
+        if overlap_hit
+            && let Some(prepped) = prep_taken.as_ref()
+            && prepped.seq == seq_peek
+            && let Some(sync) = prepped.sync.as_ref()
+        {
+            let (written, settling, in_hand) = line_sync_snapshot();
+            if crate::descriptor::sync_job_touches(sync, &written, settling, &in_hand)
+                || prep_overlaps(&prepped.steps, &written)
+                || prep_device_removed()
+            {
+                PREP_STATS[1].fetch_add(1, Ordering::Relaxed);
+            } else if crate::descriptor::apply_sync_job(sync) {
+                sync_applied = true;
+            } else {
+                PREP_STATS[1].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if !sync_applied {
+            crate::descriptor::sync_heaps();
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -6122,8 +6236,10 @@ impl Host {
         // prep bulk — `run_deferred`, the flush, `take_snapshots` and
         // `card_before`'s recording — so this thread overlaps the relay
         // landing flights and `settle_now`/`late_helper` are not blocked.
-        // `sync_heaps`/`make_waiting` stayed under `submitted` above, as did
-        // the authoritative `late_blocked`/`stale_under_flights` settles, and
+        // `sync_heaps` CAS/mirror + `make_waiting` stayed under `submitted`
+        // above (Task 5: only RPM/prints moved to the worker, applied
+        // inline there), as did the authoritative `late_blocked`/
+        // `stale_under_flights` settles, and
         // the prep guard (`PREP_SERIAL`) keeps `LINE.written` stable: no new
         // flight can be sent until the `ExecuteCommandLists` below. The
         // `card_results_low` settle in this state is relay-only
