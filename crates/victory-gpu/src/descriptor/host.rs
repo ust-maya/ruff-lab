@@ -2444,6 +2444,22 @@ impl HostHeap {
     /// kernel, which fails on a page the title unmapped meanwhile where a
     /// read in place would fault: the title unmaps heap pages too).
     pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
+        let print = record_print(record) | 1;
+        self.mirror_copied_print(index, handle, record, print)
+    }
+
+    /// [`HostHeap::mirror_copied`] with the fingerprint already computed by
+    /// the prep worker (prefetch split: worker reads bytes + prints, the
+    /// submitter only CASes and mirrors, so a landing mid-prefetch cannot
+    /// race the CAS): identical CAS/mirror/table semantics, `print` must be
+    /// `record_print(record) | 1`.
+    pub(crate) fn mirror_copied_print(
+        &self,
+        index: u32,
+        handle: u64,
+        record: &[u8],
+        print: u64,
+    ) -> bool {
         if index >= self.count {
             return false;
         }
@@ -2462,11 +2478,9 @@ impl HostHeap {
             return false;
         }
         let n = record.len();
-        // Never 0, which is "never looked at". (A multiply-and-fold over
-        // the record's words: BLAKE3 here was most of the 35 to 42 ms a
-        // frame this pass took over some 250,000 to 300,000 records, run
-        // 200.)
-        let print = record_print(record) | 1;
+        // Print (never 0, never looked at) is computed by the caller:
+        // inline callers via `mirror_copied`, the prep worker so the
+        // submitter only CASes (see `mirror_copied_print`).
         let copied = match self.copied.get() {
             Some(copied) => copied,
             None if record[..n].iter().all(|&b| b == 0) => return false,
@@ -2927,7 +2941,7 @@ pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomi
 /// equal records give equal prints, and two different records the same
 /// print about once in 2^64. Not a hash anyone can attack: the records
 /// are our own.
-fn record_print(record: &[u8]) -> u64 {
+pub(crate) fn record_print(record: &[u8]) -> u64 {
     const K: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut h = K ^ record.len() as u64;
     let mut words = record.chunks_exact(8);

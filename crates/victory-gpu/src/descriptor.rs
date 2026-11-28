@@ -285,6 +285,493 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// One prefetched read for [`SyncJob`]: owned bytes plus the record prints
+/// the worker computed in slot order (submitter only CASes/mirrors with
+/// them; see [`host::HostHeap::mirror_copied_print`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SyncRead {
+    pub(crate) from: usize,
+    pub(crate) to: usize,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) prints: Vec<u64>,
+}
+
+/// One heap's planned sync reads for [`SyncJob`]: owned, sequence-keyed by
+/// the submission's `STARTED` sequence at the [`SyncJob`] level. `range` is
+/// `(heap_start, heap_end)` (title heap memory), `heap_at` the `Heap`
+/// identity for revalidation under the submission lock (no `HostHeap`/
+/// `Arc`/`HostList` reference is held across the worker), `step` bytes per
+/// descriptor, `mirrored_count` the capped host count, `batch` the read
+/// batching (`VICTORY_HEAP_SYNC_BATCH`), `skip` whether tabled pages are
+/// skipped (`VICTORY_HEAP_SYNC_SKIP`). `peeked` is the worker's
+/// non-destructive journal look (destructive `take` stays on the
+/// submitter); `skipped_spans` the spans the worker skipped as all-tabled.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SyncHeap {
+    pub(crate) heap_start: u64,
+    pub(crate) heap_end: u64,
+    pub(crate) heap_at: usize,
+    pub(crate) step: u64,
+    pub(crate) mirrored_count: u32,
+    pub(crate) batch: Option<usize>,
+    pub(crate) skip: bool,
+    pub(crate) peeked: Vec<(usize, usize)>,
+    /// Journal generation per `peeked` page (see `watch::Tracked`):
+    /// a page whose generation moved by the submitter's `take` is
+    /// re-read, never mirrored stale.
+    pub(crate) stamps: Vec<(usize, u64)>,
+    pub(crate) skipped_spans: Vec<(usize, usize)>,
+    pub(crate) reads: Vec<SyncRead>,
+}
+
+/// Worker-prefetched sync plan + bytes for one submission: the pure-CPU
+/// part of [`sync_heaps`] (heap snapshot, `plan_sync_reads` planning,
+/// `records_left_to_draws` check, RPM reads, slicing, `record_print`).
+/// The destructive `written.take`, the `copied` CAS + host-heap mutation,
+/// `SYNCED` counts and retire stay on the submitter under `submitted`
+/// after settle (see [`apply_sync_job`]); `snapshots`/`card_ranges` in
+/// `Prepared` stay empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SyncJob {
+    pub(crate) heaps: Vec<SyncHeap>,
+}
+
+impl SyncJob {
+    /// One heap with one empty read per range (tests only).
+    #[cfg(test)]
+    pub(crate) fn from_reads(reads: Vec<(usize, usize)>) -> Self {
+        Self {
+            heaps: vec![SyncHeap {
+                peeked: reads.clone(),
+                reads: reads
+                    .into_iter()
+                    .map(|(from, to)| SyncRead {
+                        from,
+                        to,
+                        bytes: vec![0; to.saturating_sub(from)],
+                        prints: Vec::new(),
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+        }
+    }
+}
+
+/// Whether any planned sync range touches `written`/`in_hand` (title
+/// memory flights may still write), or a settle is landing (`settling`
+/// with non-empty sync: the relay may be writing heap pages now). Pure
+/// range check, for `wait_done` before and after the done-wait and the
+/// submitter's final check after settle.
+pub(crate) fn sync_job_touches(
+    job: &SyncJob,
+    written: &[(usize, usize)],
+    settling: bool,
+    in_hand: &[(usize, usize)],
+) -> bool {
+    fn overlap(a: (usize, usize), b: &[ (usize, usize)]) -> bool {
+        a.0 < a.1 && b.iter().any(|&(f, t)| f < a.1 && a.0 < t)
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for heap in &job.heaps {
+        ranges.extend_from_slice(&heap.peeked);
+        ranges.extend(heap.reads.iter().map(|r| (r.from, r.to)));
+    }
+    if ranges.iter().all(|&(f, t)| f >= t) {
+        return false;
+    }
+    if settling {
+        return true;
+    }
+    ranges.iter().any(|&r| overlap(r, written) || overlap(r, in_hand))
+}
+
+/// [`sync_heaps`] prefetched on the `victory-prep` worker: snapshots the
+/// heaps, `peek`s the journals (never `take`), plans with
+/// `plan_sync_reads`, checks `records_left_to_draws`, then RPM-reads
+/// (`read_into`/`plaincopy`) and slices + `record_print`s. Touches no
+/// `submitted`/`CARD_WORK`/fence/event/`LINE` and holds no host references
+/// across the reads; `None` when `VICTORY_HEAP_SYNC=0` (caller runs the
+/// inline path, which also no-ops).
+#[cfg(windows)]
+pub(crate) fn prefetch_sync_job() -> Option<SyncJob> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let batch = heap_sync_batch();
+    let skip_tabled = heap_sync_skip();
+    struct Snap {
+        heap_start: u64,
+        heap_end: u64,
+        heap_at: usize,
+        step: u64,
+        mirrored_count: u32,
+        peeked: Vec<(usize, usize)>,
+        stamps: Vec<(usize, u64)>,
+        planned: Vec<(usize, usize)>,
+        skipped_spans: Vec<(usize, usize)>,
+    }
+    let snaps: Vec<Snap> = {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for &(start, end, at) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed when dropped under
+            // write lock); the read lock is held for the whole snapshot.
+            let heap = unsafe { &*(at as *const Heap) };
+            let (Some(Some(host)), Some(written), Some(step)) =
+                (heap.host.get(), &heap.written, increment(heap.desc.kind))
+            else {
+                continue;
+            };
+            let step = u64::from(step);
+            let mirrored_count = heap.desc.count.min(host.count());
+            let (peeked, stamps) = written.peek_stamped(start as usize, end as usize);
+            let mut pages_touched: Vec<(usize, usize)> = Vec::new();
+            for (range_from, range_end) in &peeked {
+                let mut page = range_from & !(crate::watch::PAGE - 1);
+                while page < *range_end {
+                    let from = page.max(*range_from);
+                    let to = (page + crate::watch::PAGE).min(*range_end);
+                    pages_touched.push((from, to));
+                    page += crate::watch::PAGE;
+                }
+            }
+            let mut skipped_spans: Vec<(usize, usize)> = Vec::new();
+            let planned = plan_sync_reads(&pages_touched, batch, |from, to| {
+                if !skip_tabled {
+                    return false;
+                }
+                let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                let first = slots.start as u32;
+                let last = slots.end as u32;
+                if first >= last || host.records_left_to_draws(first, last) {
+                    skipped_spans.push((from, to));
+                    true
+                } else {
+                    false
+                }
+            });
+            out.push(Snap {
+                heap_start: start,
+                heap_end: end,
+                heap_at: at,
+                step,
+                mirrored_count,
+                peeked,
+                stamps,
+                planned,
+                skipped_spans,
+            });
+        }
+        out
+    };
+    // No SHADER_HEAPS lock, no host references below: title-memory RPM only.
+    let mut heaps = Vec::with_capacity(snaps.len());
+    for snap in snaps {
+        let mut reads = Vec::new();
+        for (from, to) in snap.planned {
+            reads.extend(read_pieces(from, to, snap.heap_start, snap.step, snap.mirrored_count));
+        }
+        heaps.push(SyncHeap {
+            heap_start: snap.heap_start,
+            heap_end: snap.heap_end,
+            heap_at: snap.heap_at,
+            step: snap.step,
+            mirrored_count: snap.mirrored_count,
+            batch,
+            skip: skip_tabled,
+            peeked: snap.peeked,
+            stamps: snap.stamps,
+            skipped_spans: snap.skipped_spans,
+            reads,
+        });
+    }
+    Some(SyncJob { heaps })
+}
+
+/// RPM pieces of one planned read: like [`mirror_read`]'s reads (whole
+/// span, then per-page fallback) without mirroring; prints in slot order.
+#[cfg(windows)]
+fn read_pieces(
+    from: usize,
+    to: usize,
+    heap_start: u64,
+    step: u64,
+    mirrored_count: u32,
+) -> Vec<SyncRead> {
+    let mut out = Vec::new();
+    if from >= to {
+        return out;
+    }
+    let mut buf = vec![0u8; to - from];
+    if crate::host::read_into(from as *const u8, &mut buf) {
+        let prints = prints_for(from, &buf, heap_start, step, mirrored_count);
+        out.push(SyncRead { from, to, bytes: buf, prints });
+        return out;
+    }
+    if to - from <= crate::watch::PAGE {
+        return out;
+    }
+    let mut page = from & !(crate::watch::PAGE - 1);
+    while page < to {
+        let start = page.max(from);
+        let end = (page + crate::watch::PAGE).min(to);
+        let mut buf = vec![0u8; end - start];
+        if crate::host::read_into(start as *const u8, &mut buf) {
+            let prints = prints_for(start, &buf, heap_start, step, mirrored_count);
+            out.push(SyncRead { from: start, to: end, bytes: buf, prints });
+        }
+        page += crate::watch::PAGE;
+    }
+    out
+}
+
+/// `record_print` of every fitting record in `bytes` (from `base`), in
+/// [`changed_slots`] order (same order [`mirror_records_prefetched`]
+/// pairs them).
+#[cfg(windows)]
+fn prints_for(base: usize, bytes: &[u8], heap_start: u64, step: u64, mirrored_count: u32) -> Vec<u64> {
+    let mut prints = Vec::new();
+    let slots = changed_slots(base, base + bytes.len(), heap_start as usize, step, mirrored_count);
+    for index in slots {
+        let handle = heap_start + index * step;
+        let Some(at) = (handle as usize).checked_sub(base) else {
+            continue;
+        };
+        let Some(record) = bytes.get(at..at + step as usize) else {
+            continue;
+        };
+        prints.push(host::record_print(record) | 1);
+    }
+    prints
+}
+
+/// Whether a prefetched read still names the title bytes of the
+/// submitter's `take`: every watch page under `[from, to)` must have the
+/// same journal generation in the worker's `peek` and the submitter's
+/// `take` (a copy-back/titles-copy landing on an already-dirty page mid-
+/// prefetch advances only the generation, and the re-read below catches
+/// it). Pure map comparison.
+#[cfg(windows)]
+fn read_stamps_match(
+    peek: &std::collections::HashMap<usize, u64>,
+    taken: &std::collections::HashMap<usize, u64>,
+    from: usize,
+    to: usize,
+) -> bool {
+    if from >= to {
+        return false;
+    }
+    let page = crate::watch::PAGE;
+    (from / page..=(to - 1) / page)
+        .all(|p| peek.get(&p).is_some_and(|&g| taken.get(&p) == Some(&g)))
+}
+
+/// Applies a worker-prefetched [`SyncJob`] on the submitter under
+/// `submitted` after settle. Returns `false` (before any destructive
+/// `take`, so the caller can run [`sync_heaps`] inline byte-identical)
+/// only if a skipped all-tabled span is no longer left to its draws;
+/// otherwise the `take` re-asks the journal after any landing (so a
+/// copy-back/shadow landing mid-prefetch is not lost) and always
+/// completes mirroring for the taken ranges (prefetched bytes where the
+/// span matches exactly and its pages did not move, inline RPM
+/// otherwise), counting `SYNCED` like [`sync_heaps`].
+#[cfg(windows)]
+pub(crate) fn apply_sync_job(job: &SyncJob) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    let batch = heap_sync_batch();
+    let skip_tabled = heap_sync_skip();
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    // Live heaps (a job heap that vanished is ignored: its journal is
+    // gone with it; a live heap without a job entry is read inline below).
+    struct Live {
+        start: u64,
+        end: u64,
+        at: usize,
+        host_at: *const host::HostHeap,
+        step: u64,
+        mirrored_count: u32,
+    }
+    let mut live: Vec<Live> = Vec::new();
+    for &(start, end, at) in heaps.iter() {
+        // SAFETY: registered heaps are live under the read lock.
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(written), Some(step)) =
+            (heap.host.get(), &heap.written, increment(heap.desc.kind))
+        else {
+            continue;
+        };
+        let step = u64::from(step);
+        let mirrored_count = heap.desc.count.min(host.count());
+        // Skipped all-tabled spans must still be left to draws (checked
+        // before any `take`, so a failure runs the inline path whose
+        // journal is still virgin).
+        let _ = written;
+        if skip_tabled
+            && let Some(entry) = job.heaps.iter().find(|e| e.heap_at == at)
+        {
+            for &(from, to) in &entry.skipped_spans {
+                let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                let first = slots.start as u32;
+                let last = slots.end as u32;
+                if first < last && !host.records_left_to_draws(first, last) {
+                    drop(heaps);
+                    return false;
+                }
+            }
+        }
+        // SAFETY: `heaps` read lock is held for the rest of this call.
+        live.push(Live {
+            start,
+            end,
+            at,
+            host_at: std::ptr::from_ref::<host::HostHeap>(host),
+            step,
+            mirrored_count,
+        });
+    }
+    // Destructive take + mirror (scoped per heap, as `sync_heaps`).
+    let mut pages = 0u64;
+    let mut looked = 0u64;
+    let mut mirrored = 0u64;
+    let mut skipped = 0u64;
+    for i in 0..live.len() {
+        // SAFETY: the heap is live under the read lock.
+        let (start, end, at, host, step, mirrored_count) = {
+            let l = &live[i];
+            (l.start, l.end, l.at, unsafe { &*l.host_at }, l.step, l.mirrored_count)
+        };
+        // SAFETY: registered heaps are live (removed when dropped under write lock).
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(written) = &heap.written else {
+            continue;
+        };
+        let (taken, stamps) = written.take_stamped(start as usize, end as usize);
+        let mut pages_touched: Vec<(usize, usize)> = Vec::new();
+        for (range_from, range_end) in &taken {
+            let mut page = range_from & !(crate::watch::PAGE - 1);
+            while page < *range_end {
+                let from = page.max(*range_from);
+                let to = (page + crate::watch::PAGE).min(*range_end);
+                pages_touched.push((from, to));
+                page += crate::watch::PAGE;
+            }
+        }
+        let mut skipped_here = 0u64;
+        let reads = plan_sync_reads(&pages_touched, batch, |from, to| {
+            if !skip_tabled {
+                return false;
+            }
+            let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+            let first = slots.start as u32;
+            let last = slots.end as u32;
+            if first >= last || host.records_left_to_draws(first, last) {
+                skipped_here += 1;
+                true
+            } else {
+                false
+            }
+        });
+        skipped += skipped_here;
+        let entry = job.heaps.iter().find(|e| e.heap_at == at);
+        let generations: std::collections::HashMap<usize, u64> = stamps.into_iter().collect();
+        let entry_stamps = entry.map_or(Vec::new(), |e| e.stamps.clone());
+        let peeked: std::collections::HashMap<usize, u64> = entry_stamps.into_iter().collect();
+        let process = |chunk: &[(usize, usize)]| -> (u64, u64, u64) {
+            let (mut p, mut l, mut m) = (0u64, 0u64, 0u64);
+            let mut page_bytes: Vec<u8> = Vec::new();
+            let mut fallback: Vec<u8> = Vec::new();
+            for &(from, to) in chunk {
+                let unchanged = read_stamps_match(&peeked, &generations, from, to);
+                if unchanged
+                    && let Some(read) = entry.and_then(|e| e.reads.iter().find(|r| r.from == from && r.to == to))
+                {
+                    p += page_pieces(from, to, crate::watch::PAGE);
+                    let (dl, dm) = mirror_records_prefetched(host, from, &read.bytes, &read.prints, start, step, mirrored_count);
+                    l += dl;
+                    m += dm;
+                } else {
+                    let (np, nl, nm) = mirror_read(host, &mut page_bytes, &mut fallback, from, to, start, step, mirrored_count);
+                    p += np;
+                    l += nl;
+                    m += nm;
+                }
+            }
+            (p, l, m)
+        };
+        if reads.len() >= 16 {
+            let threads = std::thread::available_parallelism()
+                .map_or(4, |n| (n.get() / 2).clamp(2, 6))
+                .min(reads.len() / 8)
+                .max(1);
+            let chunk_len = reads.len().div_ceil(threads);
+            let totals: Vec<(u64, u64, u64)> = std::thread::scope(|s| {
+                let handles: Vec<_> = reads.chunks(chunk_len).map(|c| s.spawn(move || process(c))).collect();
+                handles.into_iter().map(|h| h.join().unwrap_or((0, 0, 0))).collect()
+            });
+            for (p, l, m) in totals {
+                pages += p;
+                looked += l;
+                mirrored += m;
+            }
+        } else {
+            let (p, l, m) = process(&reads);
+            pages += p;
+            looked += l;
+            mirrored += m;
+        }
+    }
+    drop(heaps);
+    for (count, n) in SYNCED.iter().zip([
+        pages,
+        looked,
+        mirrored,
+        started.elapsed().as_micros() as u64,
+        skipped,
+    ]) {
+        count.fetch_add(n, Relaxed);
+    }
+    true
+}
+
+/// Mirrors prefetched `bytes` via their worker prints (CAS + mirror only;
+/// see [`host::HostHeap::mirror_copied_print`]).
+#[cfg(windows)]
+fn mirror_records_prefetched(
+    host: &host::HostHeap,
+    base: usize,
+    bytes: &[u8],
+    prints: &[u64],
+    heap_start: u64,
+    step: u64,
+    mirrored_count: u32,
+) -> (u64, u64) {
+    let mut looked = 0u64;
+    let mut mirrored = 0u64;
+    let mut prints = prints.iter();
+    let slots = changed_slots(base, base + bytes.len(), heap_start as usize, step, mirrored_count);
+    for index in slots {
+        let handle = heap_start + index * step;
+        let Some(at) = (handle as usize).checked_sub(base) else {
+            continue;
+        };
+        let Some(record) = bytes.get(at..at + step as usize) else {
+            continue;
+        };
+        looked += 1;
+        let done = match prints.next() {
+            Some(&print) => host.mirror_copied_print(index as u32, handle, record, print),
+            None => host.mirror_copied(index as u32, handle, record),
+        };
+        if done {
+            mirrored += 1;
+        }
+    }
+    (looked, mirrored)
+}
+
 /// Largest read [`sync_heaps`] issues when `VICTORY_HEAP_SYNC_BATCH` is set.
 /// `None`: one dirty watch page (64 KiB, [`crate::watch::PAGE`]) per read,
 /// as before. `1` is 1 MiB; any other value is a KiB count clamped to

@@ -59,7 +59,9 @@ pub fn parse_set_arg(s: &str) -> Result<(String, String)> {
 /// trimmed content of `docs/klbf/skip-amd.txt`. Deliberately NOT listed:
 /// `VICTORY_IDLE_LISTS`, `VICTORY_LIST_CEILING`, `VICTORY_LIBRARY_STORE_LATER`
 /// and the four Wave 7 `VICTORY_HEAP_*` flags — they stay unset unless the
-/// user passes them via `--set`.
+/// user passes them via `--set`. `VICTORY_PREP_AHEAD` is likewise opt-in only
+/// (default off; effective only with late+relay): pass
+/// `--set VICTORY_PREP_AHEAD=1` to try it, never as part of the baseline.
 #[cfg_attr(not(windows), allow(dead_code))]
 const PRESET: &[(&str, &str)] = &[
     ("VICTORY_FFX_SIMPLE", "1"),
