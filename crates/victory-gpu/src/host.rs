@@ -968,8 +968,17 @@ mod tests {
         assert!(prepared.sync.is_none());
     }
 
+    /// Serializes prep `wait_done` tests that mutate global `LINE`
+    /// (`written` / `settling` / `in_hand`). Parallel `cargo test` otherwise
+    /// races them into a false `Ready`.
+    fn prep_line_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn prep_queue_wait_done_round_trip() {
+        let _guard = prep_line_test_lock();
         let queue = PrepQueue::new();
         queue.start_worker();
         // Keep LINE.written away from the step so only completion matters.
@@ -988,6 +997,7 @@ mod tests {
 
     #[test]
     fn prep_wait_done_fallback_on_overlap() {
+        let _guard = prep_line_test_lock();
         let queue = PrepQueue::new();
         queue.start_worker();
         let saved = std::mem::take(&mut line().written);
@@ -1009,6 +1019,7 @@ mod tests {
         // Sync planned reads touching LINE.written (or settling) must fall
         // back with WHY_READ, even when steps themselves do not overlap:
         // prefetched heap bytes could be what a flight still writes.
+        let _guard = prep_line_test_lock();
         use crate::descriptor::SyncJob;
         let queue = PrepQueue::new();
         queue.start_worker();
@@ -1050,6 +1061,7 @@ mod tests {
         // marked done, so `wait_done` must time out into `Fallback`
         // instead of waiting indefinitely (review: Task 3 must add
         // timeout/removal handling). A hang here is a failure.
+        let _guard = prep_line_test_lock();
         let queue = PrepQueue::new();
         let saved = std::mem::take(&mut line().written);
         let steps = vec![PrepStep {
