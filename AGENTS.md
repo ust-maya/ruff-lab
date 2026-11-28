@@ -2,6 +2,16 @@
 
 Instructions for coding agents. Build and run steps are in `README.md`. The asset rule is in `docs/asset-policy.md`. This file only covers what those two do not.
 
+## CodeGraph
+
+This repository is indexed by [CodeGraph](https://github.com/colbymchenry/codegraph) (`.codegraph/` at the repo root, Rust fully supported). Reach for it **before** a grep/find/Read loop for any question about how code works, how X reaches Y, or surveying an area:
+
+- **Preferred (MCP):** `codegraph_explore` — one call returns the relevant symbols' verbatim source (treat it as already read, do not `Read` those files again), the call paths between them (including dynamic-dispatch hops), and a blast-radius summary. Name a file or symbol in the query to read its current line-numbered source. If the tool is listed but deferred, load it by name via tool search.
+- **Fallback (always works):** `codegraph explore "<symbol names or question>"` in a shell prints the same output.
+- **Shell equivalents for other needs:** `codegraph query <search>`, `codegraph callers <symbol>` / `callees`, `codegraph impact <symbol>`, `codegraph node <symbol|file>`, `codegraph files`, `codegraph affected [files...]`, `codegraph status`.
+
+Trust the result — do not re-verify with grep. Query directly (do not delegate exploration to a subagent that reads files, or CodeGraph becomes overhead). If there is no `.codegraph/` directory (fresh clone), skip CodeGraph entirely and use built-in tools — indexing is the user's decision. The index auto-syncs on file changes (2-second debounce); check staleness with `codegraph status` after edits. Rebuild only when needed: `codegraph sync` for incremental, `codegraph index` for a full rebuild. `.codegraph/` is local-only (see `.codegraph/.gitignore`) — commit only the marker, never the DB.
+
 ## Platform
 
 This is a Rust workspace (`edition` 2024, `rust-version` 1.88). The toolchain is Windows-only: `rust-toolchain.toml` pins `1.98.1` and `x86_64-pc-windows-msvc`. `victory-gpu` and `victory-hle` are `#[cfg(windows)]`. A Linux `cargo check` does not link them and is not a green GPU run.
